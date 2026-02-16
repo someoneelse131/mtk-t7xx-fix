@@ -25,8 +25,8 @@ sudo dnf install kernel-devel-$(uname -r) kernel-headers gcc make dkms vim-commo
 sudo grubby --update-kernel=ALL --args="iommu=pt"
 
 # 3. Clone this repo
-git clone https://github.com/YOURUSERNAME/mtk_t7xx_fix.git
-cd mtk_t7xx_fix
+git clone https://github.com/someoneelse131/mtk-t7xx-fix.git
+cd mtk-t7xx-fix
 
 # 4. Build, install, and reboot (one command does everything)
 bash reinstall.sh
@@ -57,14 +57,14 @@ nmcli connection add type gsm ifname wwan0mbim0 con-name "Mobile" apn internet
 nmcli connection up "Mobile"
 ```
 
-Some common APNs: `internet` (many carriers), `gprs.swisscom.ch` (Swisscom/Wingo).
+Replace `internet` with your carrier's APN.
 
 ## After a kernel update
 
 DKMS rebuilds the module automatically for new kernels. If the modem stops working after an update:
 
 ```bash
-cd mtk_t7xx_fix
+cd mtk-t7xx-fix
 bash reinstall.sh
 ```
 
@@ -87,10 +87,6 @@ All of this is idempotent -- safe to run repeatedly.
 |---|---|
 | `verify.sh` | Check module, dmesg, devices, ModemManager status |
 | `uninstall.sh` | Remove patched module and restore the in-tree version |
-| `fix_fcc.sh` | Set up FCC unlock + restart ModemManager (no reboot) |
-| `debug_fcc.sh` | Run FCC unlock manually with debug output |
-| `build.sh` | Build only (no install) |
-| `install.sh` | Install only (no build, no reboot) |
 
 ## Uninstall
 
@@ -115,8 +111,8 @@ FCC unlock didn't run. Check:
 ```bash
 ls -la /usr/lib64/ModemManager/fcc-unlock.d/14c3:4d75   # script installed?
 which xxd                                                 # xxd available?
-sudo bash debug_fcc.sh                                    # run unlock manually
 ```
+If either is missing, re-run `bash reinstall.sh`.
 
 **`mmcli -m 0 --enable` gives "Invalid transition":**
 ```bash
