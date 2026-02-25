@@ -2,7 +2,7 @@
 # Rebuild and reinstall the patched mtk_t7xx module, then reboot.
 # Safe to run multiple times — fully idempotent.
 #
-# Usage:  sudo bash reinstall.sh
+# Usage:  bash reinstall.sh
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"

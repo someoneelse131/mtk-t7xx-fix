@@ -6,12 +6,13 @@ Tested on Lenovo ThinkPad X1 Carbon Gen 11, Fedora 43, kernel 6.18.
 
 ## The problem
 
-On Fedora 43 the in-tree `mtk_t7xx` driver fails to initialize the modem. Four separate issues stack up:
+On Fedora 43 the in-tree `mtk_t7xx` driver fails to initialize the modem. Five separate issues stack up:
 
 1. **PM timeout treated as fatal** -- the modem's PCIe power-management status register never becomes ready. The driver aborts instead of continuing without PM.
 2. **NULL pointer crash** -- the error-recovery path calls `kthread_stop()` twice on the same thread without NULLing the pointer.
 3. **FCC unlock broken** -- Lenovo's unlock binary segfaults, and ModemManager's built-in unlock script silently fails because `xxd` isn't installed.
-4. **Lenovo services hijack the modem** -- `fibo_helper` / `fibo_flash` / `fwswitch` force the modem into fastboot mode ~15 s after it connects.
+4. **Lenovo services hijack the modem** -- `fibo_helper` / `fibo_flash` / `fwswitch` / `lenovo-cfgservice` force the modem into fastboot mode ~15 s after it connects.
+5. **s2idle sleep kills the connection** -- after resume the modem's MBIM session is stale but ModemManager doesn't know, so it loops "Operation aborted" forever.
 
 The same hardware works fine on Ubuntu (kernel 6.14) because it uses IOMMU passthrough and doesn't ship the Lenovo services.
 
@@ -79,7 +80,8 @@ All of this is idempotent -- safe to run repeatedly.
 5. Installs `xxd` if missing (needed by the FCC unlock script)
 6. Disables Lenovo Fibocom services that force the modem into fastboot
 7. Adds a systemd drop-in to cap ModemManager's stop timeout at 5 s (it hangs for 45 s otherwise)
-8. Rebuilds initramfs and reboots
+8. Installs a systemd sleep hook to restart ModemManager after resume (fixes stale MBIM session)
+9. Rebuilds initramfs and reboots
 
 ## Other scripts
 
@@ -127,9 +129,19 @@ Lenovo services are forcing the modem into fastboot:
 ```bash
 journalctl -b | grep fastboot_switching
 # If you see "t7xx_mode, command: fastboot_switching":
-sudo systemctl disable --now fibo_helper.service fibo_flash.service fwswitch.service
+sudo systemctl disable --now fibo_helper.service fibo_flash.service fwswitch.service lenovo-cfgservice.service
 sudo reboot
 ```
+
+**Modem not working after sleep/resume:**
+
+ModemManager should restart automatically after resume. If it doesn't:
+```bash
+sudo systemctl restart ModemManager
+sleep 15
+mmcli -m 0
+```
+If the modem is gone from PCI entirely, a full reboot is needed.
 
 **Connection fails with "service option not subscribed":**
 
@@ -141,10 +153,13 @@ nmcli connection up "Mobile"
 
 ## Applies to
 
-- Fibocom FM350-GL (PCI `14c3:4d75`) -- found in ThinkPad X1 Carbon Gen 11, T14s Gen 4, and other Lenovo laptops
-- Fedora 42/43 with kernel 6.17+
-- Likely affects any distro that uses strict IOMMU by default
+Tested on a ThinkPad X1 Carbon Gen 11 with Fibocom FM350-GL, Fedora 43, kernel 6.18. Should also work on:
+
+- Other Lenovo laptops with the Fibocom FM350-GL (PCI `14c3:4d75`) -- T14s Gen 4, etc.
+- Dell DW5933e (PCI `14c0:4d75`) -- same MediaTek T700 chip, already in the driver's PCI ID table
+- Fedora 42 with kernel 6.17+ (untested)
+- Likely any distro that uses strict IOMMU by default
 
 ## Technical details
 
-See the patched files in `src/` -- the key changes are in `t7xx_pci.c` (PM timeout made non-fatal, poll timeout increased to 500 ms), `t7xx_state_monitor.c` (device-stage timeout increased to 60 s), and `t7xx_port_ctrl_msg.c` (NULL pointer after kthread_stop).
+See the patched files in `src/` -- the key changes are in `t7xx_pci.c` (PM timeout made non-fatal, poll timeout increased to 500 ms, D3cold disabled, suspend_noirq/resume_noirq keep the device in D0 with a reprobe fallback on handshake failure), `t7xx_state_monitor.c` (device-stage timeout increased to 60 s), and `t7xx_port_ctrl_msg.c` (NULL pointer after kthread_stop).

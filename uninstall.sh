@@ -32,6 +32,35 @@ if [ -f /etc/modprobe.d/blacklist-mtk-t7xx.conf ]; then
     rm /etc/modprobe.d/blacklist-mtk-t7xx.conf
 fi
 
+# Remove sleep hook
+SLEEP_HOOK="/usr/lib/systemd/system-sleep/99-modem-fix.sh"
+if [ -f "$SLEEP_HOOK" ]; then
+    echo "Removing sleep hook..."
+    rm "$SLEEP_HOOK"
+fi
+
+# Remove FCC unlock script
+FCC_UNLOCK="/usr/lib64/ModemManager/fcc-unlock.d/14c3:4d75"
+if [ -f "$FCC_UNLOCK" ]; then
+    echo "Removing FCC unlock script..."
+    rm "$FCC_UNLOCK"
+fi
+
+# Remove ModemManager drop-in
+MM_DROPIN_DIR="/etc/systemd/system/ModemManager.service.d"
+MM_DROPIN="${MM_DROPIN_DIR}/quick-stop.conf"
+if [ -f "$MM_DROPIN" ]; then
+    echo "Removing ModemManager drop-in..."
+    rm "$MM_DROPIN"
+    rmdir "$MM_DROPIN_DIR" 2>/dev/null || true
+    systemctl daemon-reload
+fi
+
+# Re-enable Lenovo services (best-effort — they may not exist on all systems)
+for svc in fibo_helper.service fibo_flash.service fwswitch.service lenovo-cfgservice.service; do
+    systemctl enable "$svc" 2>/dev/null || true
+done
+
 # Rebuild initramfs
 echo "Rebuilding initramfs..."
 if command -v dracut &>/dev/null; then
