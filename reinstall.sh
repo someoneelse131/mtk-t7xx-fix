@@ -110,6 +110,25 @@ TimeoutStopSec=5
 EOF
 systemctl daemon-reload
 
+# Install systemd sleep hook to restart ModemManager after s2idle resume.
+# The modem's MBIM session becomes stale after s2idle — MM doesn't know and
+# loops "Operation aborted" forever. Restarting MM forces a fresh MBIM_OPEN.
+SLEEP_HOOK="/usr/lib/systemd/system-sleep/99-modem-fix.sh"
+cat > "$SLEEP_HOOK" <<'HOOKEOF'
+#!/bin/bash
+# Restart ModemManager after resume so it opens a fresh MBIM session.
+# Without this, the modem's MBIM channel is stale after s2idle and MM
+# endlessly fails with "Operation aborted".
+case "$1" in
+    post)
+        # Short delay to let the modem finish its resume handshake
+        sleep 2
+        systemctl restart ModemManager
+        ;;
+esac
+HOOKEOF
+chmod 755 "$SLEEP_HOOK"
+
 # Rebuild initramfs
 echo "Rebuilding initramfs..."
 dracut --force

@@ -239,6 +239,11 @@ static int t7xx_pci_pm_init(struct t7xx_pci_dev *t7xx_dev)
 	dev_pm_set_driver_flags(&pdev->dev, pdev->dev.power.driver_flags |
 				DPM_FLAG_NO_DIRECT_COMPLETE);
 
+	/* Prevent D3cold during s2idle — the modem firmware cannot survive
+	 * a full power cut and would reboot, breaking the resume handshake.
+	 */
+	pci_d3cold_disable(pdev);
+
 	iowrite32(T7XX_L1_BIT(0), IREG_BASE(t7xx_dev) + DISABLE_ASPM_LOWPWR);
 	pm_runtime_set_autosuspend_delay(&pdev->dev, PM_AUTOSUSPEND_MS);
 	pm_runtime_use_autosuspend(&pdev->dev);
@@ -574,6 +579,7 @@ static int __t7xx_pci_pm_resume(struct pci_dev *pdev, bool state_check)
 
 	t7xx_dev = pci_get_drvdata(pdev);
 	if (atomic_read(&t7xx_dev->md_pm_state) <= MTK_PM_INIT) {
+		dev_info(&pdev->dev, "[PM] Resume: skipped, pm_state <= INIT\n");
 		iowrite32(T7XX_L1_BIT(0), IREG_BASE(t7xx_dev) + ENABLE_ASPM_LOWPWR);
 		return 0;
 	}
@@ -582,15 +588,14 @@ static int __t7xx_pci_pm_resume(struct pci_dev *pdev, bool state_check)
 	prev_state = ioread32(IREG_BASE(t7xx_dev) + T7XX_PCIE_PM_RESUME_STATE);
 
 	if (state_check) {
-		/* For D3/L3 resume, the device could boot so quickly that the
-		 * initial value of the dummy register might be overwritten.
-		 * Identify new boots if the ATR source address register is not initialized.
-		 */
 		u32 atr_reg_val = ioread32(IREG_BASE(t7xx_dev) +
 					   ATR_PCIE_WIN0_T0_ATR_PARAM_SRC_ADDR);
+		dev_info(&pdev->dev, "[PM] Resume: prev_state=%u atr=0x%08x pci_state=%d\n",
+			 prev_state, atr_reg_val, pdev->current_state);
 		if (prev_state == PM_RESUME_REG_STATE_L3 ||
 		    (prev_state == PM_RESUME_REG_STATE_INIT &&
-		     atr_reg_val == ATR_SRC_ADDR_INVALID)) {
+		     (atr_reg_val == ATR_SRC_ADDR_INVALID || atr_reg_val == 0))) {
+			dev_info(&pdev->dev, "[PM] Resume: L3/D3 detected, reprobing\n");
 			ret = t7xx_pci_reprobe_early(t7xx_dev);
 			if (ret)
 				return ret;
@@ -600,6 +605,7 @@ static int __t7xx_pci_pm_resume(struct pci_dev *pdev, bool state_check)
 
 		if (prev_state == PM_RESUME_REG_STATE_EXP ||
 		    prev_state == PM_RESUME_REG_STATE_L2_EXP) {
+			dev_info(&pdev->dev, "[PM] Resume: exception state %u\n", prev_state);
 			if (prev_state == PM_RESUME_REG_STATE_L2_EXP) {
 				ret = t7xx_pcie_reinit(t7xx_dev, false);
 				if (ret)
@@ -621,12 +627,15 @@ static int __t7xx_pci_pm_resume(struct pci_dev *pdev, bool state_check)
 		}
 
 		if (prev_state == PM_RESUME_REG_STATE_L2) {
+			dev_info(&pdev->dev, "[PM] Resume: L2, reinit PCIe\n");
 			ret = t7xx_pcie_reinit(t7xx_dev, false);
 			if (ret)
 				return ret;
 
 		} else if (prev_state != PM_RESUME_REG_STATE_L1 &&
 			   prev_state != PM_RESUME_REG_STATE_INIT) {
+			dev_warn(&pdev->dev,
+				 "[PM] Resume: unknown state %u, stopping FSM\n", prev_state);
 			ret = t7xx_send_fsm_command(t7xx_dev, FSM_CMD_STOP);
 			if (ret)
 				return ret;
@@ -637,6 +646,7 @@ static int __t7xx_pci_pm_resume(struct pci_dev *pdev, bool state_check)
 		}
 	}
 
+	dev_info(&pdev->dev, "[PM] Resume: handshake path\n");
 	iowrite32(T7XX_L1_BIT(0), IREG_BASE(t7xx_dev) + DISABLE_ASPM_LOWPWR);
 	t7xx_wait_pm_config(t7xx_dev);
 
@@ -646,8 +656,15 @@ static int __t7xx_pci_pm_resume(struct pci_dev *pdev, bool state_check)
 	}
 
 	ret = t7xx_send_pm_request(t7xx_dev, H2D_CH_RESUME_REQ);
-	if (ret)
-		dev_err(&pdev->dev, "[PM] MD resume error: %d\n", ret);
+	if (ret) {
+		dev_warn(&pdev->dev,
+			 "[PM] MD resume handshake failed (%d), attempting full reprobe\n", ret);
+		ret = t7xx_pci_reprobe_early(t7xx_dev);
+		if (ret)
+			return ret;
+
+		return t7xx_pci_reprobe(t7xx_dev, true);
+	}
 
 	if (t7xx_send_pm_request(t7xx_dev, H2D_CH_RESUME_REQ_AP))
 		dev_warn(&pdev->dev, "[PM] SAP resume timeout, continuing anyway\n");
@@ -668,6 +685,18 @@ static int __t7xx_pci_pm_resume(struct pci_dev *pdev, bool state_check)
 	atomic_set(&t7xx_dev->md_pm_state, MTK_PM_RESUMED);
 
 	return ret;
+}
+
+static int t7xx_pci_pm_suspend_noirq(struct device *dev)
+{
+	struct pci_dev *pdev = to_pci_dev(dev);
+
+	/* Save PCI state now so the PCI core sees state_saved == true
+	 * and skips pci_prepare_to_sleep(), keeping the device in D0.
+	 * The modem firmware cannot survive D3hot or D3cold.
+	 */
+	pci_save_state(pdev);
+	return 0;
 }
 
 static int t7xx_pci_pm_resume_noirq(struct device *dev)
@@ -728,6 +757,7 @@ static int t7xx_pci_pm_runtime_resume(struct device *dev)
 static const struct dev_pm_ops t7xx_pci_pm_ops = {
 	.prepare = t7xx_pci_pm_prepare,
 	.suspend = t7xx_pci_pm_suspend,
+	.suspend_noirq = t7xx_pci_pm_suspend_noirq,
 	.resume = t7xx_pci_pm_resume,
 	.resume_noirq = t7xx_pci_pm_resume_noirq,
 	.freeze = t7xx_pci_pm_suspend,
