@@ -128,6 +128,7 @@ case "$1" in
 esac
 HOOKEOF
 chmod 755 "$SLEEP_HOOK"
+restorecon "$SLEEP_HOOK" 2>/dev/null || true
 
 # Rebuild initramfs
 echo "Rebuilding initramfs..."
