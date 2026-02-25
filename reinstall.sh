@@ -53,7 +53,7 @@ fi
 # --- Install (needs root) ---
 if [ "$EUID" -ne 0 ]; then
     echo "Build succeeded. Elevating for install..."
-    exec sudo bash "$0" --skip-build
+    exec sudo bash "$SCRIPT_DIR/reinstall.sh" --skip-build
 fi
 
 echo "=== Installing via DKMS ==="
