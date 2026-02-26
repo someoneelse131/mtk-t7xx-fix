@@ -119,11 +119,21 @@ cat > "$SLEEP_HOOK" <<'HOOKEOF'
 # Restart ModemManager after resume so it opens a fresh MBIM session.
 # Without this, the modem's MBIM channel is stale after s2idle and MM
 # endlessly fails with "Operation aborted".
+#
+# Debug with:  journalctl -b | grep modem-fix
+LOG_TAG="modem-fix"
+
+logger -t "$LOG_TAG" "hook called: action=$1 target=${2:-unknown}"
+
 case "$1" in
     post)
-        # Short delay to let the modem finish its resume handshake
-        sleep 2
-        systemctl restart ModemManager
+        logger -t "$LOG_TAG" "resume detected, restarting ModemManager in 2s"
+        (
+            sleep 2
+            systemctl restart ModemManager
+            rc=$?
+            logger -t "$LOG_TAG" "ModemManager restart exit code: $rc"
+        ) &
         ;;
 esac
 HOOKEOF
