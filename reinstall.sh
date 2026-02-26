@@ -73,7 +73,7 @@ dkms add    "${MODULE_NAME}/${MODULE_VERSION}"
 dkms build  "${MODULE_NAME}/${MODULE_VERSION}" -k "$KVER"
 dkms install "${MODULE_NAME}/${MODULE_VERSION}" -k "$KVER"
 
-# Remove stale blacklist if present — DKMS extra/ dir already takes
+# Remove stale blacklist if present — DKMS updates/ dir already takes
 # priority over the in-tree kernel/ dir via depmod ordering.
 rm -f "$BLACKLIST_CONF"
 
