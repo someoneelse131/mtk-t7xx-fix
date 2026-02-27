@@ -1,6 +1,7 @@
 # Fix Fibocom FM350 (mtk_t7xx) on Fedora
 
-> **Warning:** This project is currently in testing. The patched driver may cause kernel panics (boot hangs, blinking Caps Lock LED) on some systems. Use at your own risk and make sure you know how to [uninstall](#uninstall) before installing.
+> [!WARNING]
+> This project is currently in testing. The patched driver may cause kernel panics (boot hangs, blinking Caps Lock LED) on some systems. Use at your own risk and make sure you know how to [uninstall](#uninstall) before installing.
 
 Patches the `mtk_t7xx` kernel driver so the Fibocom FM350-GL (MediaTek T700, PCI ID `14c3:4d75`) WWAN modem actually works on Fedora (kernels 6.17+).
 
