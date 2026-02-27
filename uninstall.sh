@@ -61,6 +61,15 @@ for svc in fibo_helper.service fibo_flash.service fwswitch.service lenovo-cfgser
     systemctl enable "$svc" 2>/dev/null || true
 done
 
+# Optionally remove iommu=pt kernel parameter (set by reinstall.sh)
+if grep -q 'iommu=pt' /proc/cmdline; then
+    read -rp "Remove iommu=pt kernel parameter? [y/N] " ans
+    if [[ "$ans" =~ ^[Yy]$ ]]; then
+        echo "Removing iommu=pt from kernel parameters..."
+        grubby --update-kernel=ALL --remove-args="iommu=pt"
+    fi
+fi
+
 # Rebuild initramfs
 echo "Rebuilding initramfs..."
 if command -v dracut &>/dev/null; then
