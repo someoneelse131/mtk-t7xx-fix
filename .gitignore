@@ -1,3 +1,7 @@
+# All dotfiles (build artifacts, editor swap, Claude Code, etc.)
+.*
+!.gitignore
+
 # Kernel module build artifacts
 *.o
 *.ko
@@ -8,7 +12,6 @@
 *.symvers
 *.cmd
 .tmp_versions/
-.cache.mk
 
 # DKMS
 /dkms.conf.bak
