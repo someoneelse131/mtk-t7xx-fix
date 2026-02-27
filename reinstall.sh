@@ -128,12 +128,8 @@ logger -t "$LOG_TAG" "hook called: action=$1 target=${2:-unknown}"
 case "$1" in
     post)
         logger -t "$LOG_TAG" "resume detected, restarting ModemManager in 2s"
-        (
-            sleep 2
-            systemctl restart ModemManager
-            rc=$?
-            logger -t "$LOG_TAG" "ModemManager restart exit code: $rc"
-        ) &
+        systemd-run --no-block --unit=modem-fix-resume \
+            bash -c 'sleep 2; systemctl restart ModemManager; logger -t modem-fix "ModemManager restart exit code: $?"'
         ;;
 esac
 HOOKEOF
