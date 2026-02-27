@@ -247,8 +247,11 @@ static int port_ctl_init(struct t7xx_port *port)
 
 	port->thread = kthread_run(port_ctl_rx_thread, port, "%s", port_conf->name);
 	if (IS_ERR(port->thread)) {
+		int ret = PTR_ERR(port->thread);
+
 		dev_err(port->dev, "Failed to start port control thread\n");
-		return PTR_ERR(port->thread);
+		port->thread = NULL;
+		return ret;
 	}
 
 	port->rx_length_th = CTRL_QUEUE_MAXLEN;
