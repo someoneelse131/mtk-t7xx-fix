@@ -16,6 +16,9 @@
 # DKMS
 /dkms.conf.bak
 
+# Test logs
+*.log
+
 # Editor
 *~
 *.swp
