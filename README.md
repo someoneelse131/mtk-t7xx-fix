@@ -1,23 +1,26 @@
 # Fix Fibocom FM350 (mtk_t7xx) on Fedora
 
-> [!WARNING]
-> This project is currently in testing. The patched driver may cause kernel panics (boot hangs, blinking Caps Lock LED) on some systems. Use at your own risk and make sure you know how to [uninstall](#uninstall) before installing.
-
 Patches the `mtk_t7xx` kernel driver so the Fibocom FM350-GL (MediaTek T700, PCI ID `14c3:4d75`) WWAN modem actually works on Fedora (kernels 6.17+).
 
 Tested on Lenovo ThinkPad X1 Carbon Gen 11, Fedora 43, kernel 6.18.
 
+Related Fedora discussion: [Issue activating mobile internet modem on a Lenovo ThinkPad X1 Yoga Gen 8](https://discussion.fedoraproject.org/t/issue-activating-mobile-internet-modem-on-a-lenovo-thinkpad-x1-yoga-gen-8/170623)
+
 ## The problem
 
-On Fedora 43 the in-tree `mtk_t7xx` driver fails to initialize the modem. Five separate issues stack up:
+On Fedora 43 the in-tree `mtk_t7xx` driver fails to initialize the modem. Seven separate issues stack up:
 
 1. **PM timeout treated as fatal** -- the modem's PCIe power-management status register never becomes ready. The driver aborts instead of continuing without PM.
-2. **NULL pointer crash** -- the error-recovery path calls `kthread_stop()` twice on the same thread without NULLing the pointer.
-3. **FCC unlock broken** -- Lenovo's unlock binary segfaults, and ModemManager's built-in unlock script silently fails because `xxd` isn't installed.
-4. **Lenovo services hijack the modem** -- `fibo_helper` / `fibo_flash` / `fwswitch` / `lenovo-cfgservice` force the modem into fastboot mode ~15 s after it connects.
-5. **s2idle sleep kills the connection** -- after resume the modem's MBIM session is stale but ModemManager doesn't know, so it loops "Operation aborted" forever.
+2. **NULL pointer crash (double-uninit)** -- the error-recovery path calls `kthread_stop()` twice on the same thread without NULLing the pointer.
+3. **NULL pointer crash (kthread_run failure)** -- if `kthread_run()` fails, the thread pointer is left as `ERR_PTR`, so `kthread_stop()` dereferences garbage.
+4. **FCC unlock broken** -- Lenovo's unlock binary segfaults, and ModemManager's built-in unlock script silently fails because `xxd` isn't installed.
+5. **Lenovo services hijack the modem** -- `fibo_helper` / `fibo_flash` / `fwswitch` / `lenovo-cfgservice` force the modem into fastboot mode ~15 s after it connects.
+6. **Shutdown hangs for hours** -- `t7xx_pci_shutdown()` only runs the suspend path, which leaves the TX thread alive. When the modem is unresponsive, the thread polls forever and blocks poweroff.
+7. **s2idle sleep kills the connection** -- after resume the modem's MBIM session is stale but ModemManager doesn't know, so it loops "Operation aborted" forever.
 
 The same hardware works fine on Ubuntu (kernel 6.14) because it uses IOMMU passthrough and doesn't ship the Lenovo services.
+
+All seven issues are fixed by this project -- five driver patches (across three source files), plus system-level fixes handled by the install script.
 
 ## Quick start
 
@@ -165,4 +168,12 @@ Tested on a ThinkPad X1 Carbon Gen 11 with Fibocom FM350-GL, Fedora 43, kernel 6
 
 ## Technical details
 
-See the patched files in `src/` -- the key changes are in `t7xx_pci.c` (PM timeout made non-fatal, poll timeout increased to 500 ms, D3cold disabled, suspend_noirq/resume_noirq keep the device in D0 with a reprobe fallback on handshake failure), `t7xx_state_monitor.c` (device-stage timeout increased to 60 s), and `t7xx_port_ctrl_msg.c` (NULL pointer after kthread_stop).
+The patched driver source lives in `src/`. Key changes:
+
+| File | Fix |
+|---|---|
+| `t7xx_pci.c` | PM timeout made non-fatal (warn + continue), poll timeout increased to 500 ms, D3cold disabled, suspend_noirq/resume_noirq keep the device in D0 with a reprobe fallback on handshake failure |
+| `t7xx_pci.c` | Shutdown calls `t7xx_md_exit()` after suspend to stop the TX thread and prevent the poweroff hang |
+| `t7xx_port_ctrl_msg.c` | NULL `port->thread` after `kthread_stop()` (prevents double-uninit crash) |
+| `t7xx_port_ctrl_msg.c` | NULL `port->thread` on `kthread_run()` failure (prevents ERR_PTR dereference) |
+| `t7xx_state_monitor.c` | Device-stage timeout increased to 60 s |
