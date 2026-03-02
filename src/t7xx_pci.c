@@ -713,6 +713,7 @@ static int t7xx_pci_pm_resume_noirq(struct device *dev)
 static void t7xx_pci_shutdown(struct pci_dev *pdev)
 {
 	__t7xx_pci_pm_suspend(pdev);
+	t7xx_md_exit(pci_get_drvdata(pdev));
 }
 
 static int t7xx_pci_pm_prepare(struct device *dev)
