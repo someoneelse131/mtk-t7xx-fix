@@ -666,8 +666,15 @@ static int __t7xx_pci_pm_resume(struct pci_dev *pdev, bool state_check)
 		return t7xx_pci_reprobe(t7xx_dev, true);
 	}
 
-	if (t7xx_send_pm_request(t7xx_dev, H2D_CH_RESUME_REQ_AP))
-		dev_warn(&pdev->dev, "[PM] SAP resume timeout, continuing anyway\n");
+	if (t7xx_send_pm_request(t7xx_dev, H2D_CH_RESUME_REQ_AP)) {
+		dev_warn(&pdev->dev,
+			 "[PM] SAP resume timeout, attempting full reprobe\n");
+		ret = t7xx_pci_reprobe_early(t7xx_dev);
+		if (ret)
+			return ret;
+
+		return t7xx_pci_reprobe(t7xx_dev, true);
+	}
 
 	list_for_each_entry(entity, &t7xx_dev->md_pm_entities, entity) {
 		if (entity->resume) {

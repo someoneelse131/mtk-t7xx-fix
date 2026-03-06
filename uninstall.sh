@@ -52,6 +52,16 @@ if [ -d "${DKMS_DIR}" ]; then
     rm -rf "${DKMS_DIR}"
 fi
 
+# --- Clean root-owned build artifacts from project source ---
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+if [ -d "$SCRIPT_DIR/src" ]; then
+    echo "Cleaning build artifacts from source tree..."
+    rm -rf "$SCRIPT_DIR"/src/.*.cmd "$SCRIPT_DIR"/src/*.o "$SCRIPT_DIR"/src/*.ko \
+           "$SCRIPT_DIR"/src/*.mod "$SCRIPT_DIR"/src/*.mod.c \
+           "$SCRIPT_DIR"/src/modules.order "$SCRIPT_DIR"/src/Module.symvers \
+           "$SCRIPT_DIR"/src/.tmp_versions "$SCRIPT_DIR"/src/.cache.mk 2>/dev/null || true
+fi
+
 # --- Remove blacklist (legacy, shouldn't exist but clean up) ---
 if [ -f /etc/modprobe.d/blacklist-mtk-t7xx.conf ]; then
     echo "Removing module blacklist..."

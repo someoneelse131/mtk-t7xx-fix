@@ -46,9 +46,9 @@ if [ "$SKIP_BUILD" -eq 0 ]; then
     echo "=== Building patched mtk_t7xx module ==="
     cd "$SCRIPT_DIR/src"
     # Remove root-owned DKMS build artifacts that 'make clean' can't delete
-    sudo rm -f .*.cmd *.o *.ko *.mod *.mod.c modules.order Module.symvers .tmp_versions 2>/dev/null || true
-    make clean 2>/dev/null || true
-    make
+    sudo rm -rf .*.cmd *.o *.ko *.mod *.mod.c modules.order Module.symvers .tmp_versions .cache.mk 2>/dev/null || true
+    make -C /lib/modules/"$KVER"/build M="$SCRIPT_DIR/src" clean 2>/dev/null || true
+    make -C /lib/modules/"$KVER"/build M="$SCRIPT_DIR/src" modules
     echo ""
 fi
 
