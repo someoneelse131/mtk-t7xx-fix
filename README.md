@@ -2,13 +2,13 @@
 
 Patches the `mtk_t7xx` kernel driver so the Fibocom FM350-GL (MediaTek T700, PCI ID `14c3:4d75`) WWAN modem actually works on Fedora (kernels 6.17+).
 
-Tested on Lenovo ThinkPad X1 Carbon Gen 11, Fedora 43, kernel 6.18.
+Tested on Lenovo ThinkPad X1 Carbon Gen 11, Fedora 43, kernel 6.18.10.
 
 Related Fedora discussion: [Issue activating mobile internet modem on a Lenovo ThinkPad X1 Yoga Gen 8](https://discussion.fedoraproject.org/t/issue-activating-mobile-internet-modem-on-a-lenovo-thinkpad-x1-yoga-gen-8/170623)
 
 ## The problem
 
-On Fedora 43 the in-tree `mtk_t7xx` driver fails to initialize the modem. Eight separate issues stack up:
+On Fedora 43 the in-tree `mtk_t7xx` driver fails to initialize the modem. Nine separate issues stack up:
 
 1. **PM timeout treated as fatal** -- the modem's PCIe power-management status register never becomes ready. The driver aborts instead of continuing without PM.
 2. **NULL pointer crash (double-uninit)** -- the error-recovery path calls `kthread_stop()` twice on the same thread without NULLing the pointer.
@@ -18,10 +18,11 @@ On Fedora 43 the in-tree `mtk_t7xx` driver fails to initialize the modem. Eight 
 6. **Shutdown hangs for hours** -- `t7xx_pci_shutdown()` only runs the suspend path, which leaves the TX thread alive. When the modem is unresponsive, the thread polls forever and blocks poweroff.
 7. **s2idle sleep kills the connection** -- after resume the modem's MBIM session is stale but ModemManager doesn't know, so it loops "Operation aborted" forever.
 8. **Dead modem after sleep** -- the modem firmware sometimes reboots during s2idle. The ATR register retains a stale valid value, so the driver skips reprobing and attempts a normal handshake resume. The SAP channel times out but the driver continues anyway, leaving the modem in a zombie state where all communication fails.
+9. **Infinite reprobe loop freezes system** -- the fix for issue 8 unconditionally reprobed on SAP resume timeout, but this also triggers during normal L1 runtime PM resumes (e.g. when the modem is rfkill-blocked). The reprobe restarts the modem, runtime PM re-enables, the same timeout recurs, creating an infinite loop. After ~10 minutes of repeated reprobes, kernel memory is corrupted, causing a General Protection Fault, RCU stall, and total system freeze requiring a hard reboot.
 
 The same hardware works fine on Ubuntu (kernel 6.14) because it uses IOMMU passthrough and doesn't ship the Lenovo services.
 
-All eight issues are fixed by this project -- six driver patches (across three source files), plus system-level fixes handled by the install script.
+All nine issues are fixed by this project -- seven driver patches (across three source files), plus system-level fixes handled by the install script.
 
 ## Quick start
 
@@ -174,7 +175,8 @@ The patched driver source lives in `src/`. Key changes:
 | File | Fix |
 |---|---|
 | `t7xx_pci.c` | PM timeout made non-fatal (warn + continue), poll timeout increased to 500 ms, D3cold disabled, suspend_noirq/resume_noirq keep the device in D0 with a reprobe fallback on handshake failure |
-| `t7xx_pci.c` | SAP resume timeout triggers full reprobe instead of continuing with a dead modem |
+| `t7xx_pci.c` | SAP resume timeout triggers reprobe only when modem rebooted (`prev_state=INIT`), non-fatal for normal L1/L2 resumes |
+| `t7xx_pci.c` | Resume reprobe attempts capped at 3 to prevent infinite loop, counter resets on successful resume |
 | `t7xx_pci.c` | Shutdown calls `t7xx_md_exit()` after suspend to stop the TX thread and prevent the poweroff hang |
 | `t7xx_port_ctrl_msg.c` | NULL `port->thread` after `kthread_stop()` (prevents double-uninit crash) |
 | `t7xx_port_ctrl_msg.c` | NULL `port->thread` on `kthread_run()` failure (prevents ERR_PTR dereference) |

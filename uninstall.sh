@@ -10,7 +10,7 @@
 # re-enable those services for safety.
 
 MODULE_NAME="mtk_t7xx"
-MODULE_VERSION="1.0.0"
+MODULE_VERSION="1.1.1"
 DKMS_DIR="/usr/src/${MODULE_NAME}-${MODULE_VERSION}"
 
 if [ "$EUID" -ne 0 ]; then

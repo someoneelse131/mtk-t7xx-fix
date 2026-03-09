@@ -7,7 +7,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 MODULE_NAME="mtk_t7xx"
-MODULE_VERSION="1.0.0"
+MODULE_VERSION="1.1.1"
 DKMS_DIR="/usr/src/${MODULE_NAME}-${MODULE_VERSION}"
 BLACKLIST_CONF="/etc/modprobe.d/blacklist-mtk-t7xx.conf"
 KVER="$(uname -r)"
