@@ -54,6 +54,7 @@
 #define PM_AUTOSUSPEND_MS		5000
 #define PM_RESOURCE_POLL_TIMEOUT_US	500000
 #define PM_RESOURCE_POLL_STEP_US	1000
+#define MAX_RESUME_REPROBE_ATTEMPTS	3
 
 static const char * const t7xx_mode_names[] = {
 	[T7XX_UNKNOWN] = "unknown",
@@ -657,8 +658,17 @@ static int __t7xx_pci_pm_resume(struct pci_dev *pdev, bool state_check)
 
 	ret = t7xx_send_pm_request(t7xx_dev, H2D_CH_RESUME_REQ);
 	if (ret) {
+		if (t7xx_dev->resume_reprobe_count >= MAX_RESUME_REPROBE_ATTEMPTS) {
+			dev_err(&pdev->dev,
+				"[PM] MD resume failed after %u reprobe attempts, giving up\n",
+				MAX_RESUME_REPROBE_ATTEMPTS);
+			return ret;
+		}
+
+		t7xx_dev->resume_reprobe_count++;
 		dev_warn(&pdev->dev,
-			 "[PM] MD resume handshake failed (%d), attempting full reprobe\n", ret);
+			 "[PM] MD resume failed (%d), reprobe attempt %u/%u\n", ret,
+			 t7xx_dev->resume_reprobe_count, MAX_RESUME_REPROBE_ATTEMPTS);
 		ret = t7xx_pci_reprobe_early(t7xx_dev);
 		if (ret)
 			return ret;
@@ -667,13 +677,24 @@ static int __t7xx_pci_pm_resume(struct pci_dev *pdev, bool state_check)
 	}
 
 	if (t7xx_send_pm_request(t7xx_dev, H2D_CH_RESUME_REQ_AP)) {
-		dev_warn(&pdev->dev,
-			 "[PM] SAP resume timeout, attempting full reprobe\n");
-		ret = t7xx_pci_reprobe_early(t7xx_dev);
-		if (ret)
-			return ret;
+		/* Only reprobe for SAP timeout when modem rebooted during sleep
+		 * (prev_state=INIT with stale ATR). For normal L1/L2 resumes,
+		 * SAP timeout is non-fatal — matches SAP suspend timeout behavior.
+		 */
+		if (prev_state == PM_RESUME_REG_STATE_INIT &&
+		    t7xx_dev->resume_reprobe_count < MAX_RESUME_REPROBE_ATTEMPTS) {
+			t7xx_dev->resume_reprobe_count++;
+			dev_warn(&pdev->dev,
+				 "[PM] SAP resume timeout (modem rebooted), reprobe attempt %u/%u\n",
+				 t7xx_dev->resume_reprobe_count, MAX_RESUME_REPROBE_ATTEMPTS);
+			ret = t7xx_pci_reprobe_early(t7xx_dev);
+			if (ret)
+				return ret;
 
-		return t7xx_pci_reprobe(t7xx_dev, true);
+			return t7xx_pci_reprobe(t7xx_dev, true);
+		}
+
+		dev_warn(&pdev->dev, "[PM] SAP resume timeout, continuing anyway\n");
 	}
 
 	list_for_each_entry(entity, &t7xx_dev->md_pm_entities, entity) {
@@ -690,6 +711,7 @@ static int __t7xx_pci_pm_resume(struct pci_dev *pdev, bool state_check)
 	iowrite32(T7XX_L1_BIT(0), IREG_BASE(t7xx_dev) + ENABLE_ASPM_LOWPWR);
 	pm_runtime_mark_last_busy(&pdev->dev);
 	atomic_set(&t7xx_dev->md_pm_state, MTK_PM_RESUMED);
+	t7xx_dev->resume_reprobe_count = 0;
 
 	return ret;
 }

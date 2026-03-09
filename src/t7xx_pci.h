@@ -89,6 +89,7 @@ struct t7xx_pci_dev {
 	atomic_t		md_pm_state;
 	spinlock_t		md_pm_lock;		/* Protects PCI resource lock */
 	unsigned int		sleep_disable_count;
+	unsigned int		resume_reprobe_count;
 	struct completion	sleep_lock_acquire;
 #ifdef CONFIG_WWAN_DEBUGFS
 	struct dentry		*debugfs_dir;
