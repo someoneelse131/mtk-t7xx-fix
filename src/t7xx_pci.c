@@ -277,6 +277,12 @@ static int t7xx_pci_pm_reinit(struct t7xx_pci_dev *t7xx_dev)
 	 */
 	atomic_set(&t7xx_dev->md_pm_state, MTK_PM_INIT);
 
+	/* Reset init_done so that t7xx_pci_pm_prepare() blocks
+	 * subsequent suspend attempts until the modem handshake
+	 * completes again — prevents suspend/resume loops in s2idle.
+	 */
+	reinit_completion(&t7xx_dev->init_done);
+
 	pm_runtime_get_noresume(&t7xx_dev->pdev->dev);
 
 	iowrite32(T7XX_L1_BIT(0), IREG_BASE(t7xx_dev) + DISABLE_ASPM_LOWPWR);
@@ -594,9 +600,9 @@ static int __t7xx_pci_pm_resume(struct pci_dev *pdev, bool state_check)
 		dev_info(&pdev->dev, "[PM] Resume: prev_state=%u atr=0x%08x pci_state=%d\n",
 			 prev_state, atr_reg_val, pdev->current_state);
 		if (prev_state == PM_RESUME_REG_STATE_L3 ||
-		    (prev_state == PM_RESUME_REG_STATE_INIT &&
-		     (atr_reg_val == ATR_SRC_ADDR_INVALID || atr_reg_val == 0))) {
-			dev_info(&pdev->dev, "[PM] Resume: L3/D3 detected, reprobing\n");
+		    prev_state == PM_RESUME_REG_STATE_INIT) {
+			dev_info(&pdev->dev, "[PM] Resume: L3/INIT detected (prev_state=%u), reprobing\n",
+				 prev_state);
 			ret = t7xx_pci_reprobe_early(t7xx_dev);
 			if (ret)
 				return ret;
@@ -633,8 +639,7 @@ static int __t7xx_pci_pm_resume(struct pci_dev *pdev, bool state_check)
 			if (ret)
 				return ret;
 
-		} else if (prev_state != PM_RESUME_REG_STATE_L1 &&
-			   prev_state != PM_RESUME_REG_STATE_INIT) {
+		} else if (prev_state != PM_RESUME_REG_STATE_L1) {
 			dev_warn(&pdev->dev,
 				 "[PM] Resume: unknown state %u, stopping FSM\n", prev_state);
 			ret = t7xx_send_fsm_command(t7xx_dev, FSM_CMD_STOP);
@@ -676,26 +681,8 @@ static int __t7xx_pci_pm_resume(struct pci_dev *pdev, bool state_check)
 		return t7xx_pci_reprobe(t7xx_dev, true);
 	}
 
-	if (t7xx_send_pm_request(t7xx_dev, H2D_CH_RESUME_REQ_AP)) {
-		/* Only reprobe for SAP timeout when modem rebooted during sleep
-		 * (prev_state=INIT with stale ATR). For normal L1/L2 resumes,
-		 * SAP timeout is non-fatal — matches SAP suspend timeout behavior.
-		 */
-		if (prev_state == PM_RESUME_REG_STATE_INIT &&
-		    t7xx_dev->resume_reprobe_count < MAX_RESUME_REPROBE_ATTEMPTS) {
-			t7xx_dev->resume_reprobe_count++;
-			dev_warn(&pdev->dev,
-				 "[PM] SAP resume timeout (modem rebooted), reprobe attempt %u/%u\n",
-				 t7xx_dev->resume_reprobe_count, MAX_RESUME_REPROBE_ATTEMPTS);
-			ret = t7xx_pci_reprobe_early(t7xx_dev);
-			if (ret)
-				return ret;
-
-			return t7xx_pci_reprobe(t7xx_dev, true);
-		}
-
+	if (t7xx_send_pm_request(t7xx_dev, H2D_CH_RESUME_REQ_AP))
 		dev_warn(&pdev->dev, "[PM] SAP resume timeout, continuing anyway\n");
-	}
 
 	list_for_each_entry(entity, &t7xx_dev->md_pm_entities, entity) {
 		if (entity->resume) {
