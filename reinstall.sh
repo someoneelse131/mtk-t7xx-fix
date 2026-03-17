@@ -128,6 +128,13 @@ LOG_TAG="modem-fix"
 logger -t "$LOG_TAG" "hook called: action=$1 target=${2:-unknown}"
 
 case "$1" in
+    pre)
+        # Cancel any pending MM restart from a previous resume cycle.
+        # Without this, systemd-run fails with "Unit already loaded"
+        # on fast suspend/resume cycles and suspend-then-hibernate.
+        systemctl stop modem-fix-resume 2>/dev/null || true
+        systemctl reset-failed modem-fix-resume 2>/dev/null || true
+        ;;
     post)
         logger -t "$LOG_TAG" "resume detected, restarting ModemManager in 2s"
         systemd-run --no-block --unit=modem-fix-resume \

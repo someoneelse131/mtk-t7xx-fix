@@ -428,8 +428,8 @@ static int __t7xx_pci_pm_suspend(struct pci_dev *pdev)
 	t7xx_dev = pci_get_drvdata(pdev);
 	if (atomic_read(&t7xx_dev->md_pm_state) <= MTK_PM_INIT ||
 	    READ_ONCE(t7xx_dev->mode) != T7XX_READY) {
-		dev_err(&pdev->dev, "[PM] Exiting suspend, modem in invalid state\n");
-		return -EFAULT;
+		dev_warn(&pdev->dev, "[PM] Suspend: modem not ready, skipping PM handshake\n");
+		return 0;
 	}
 
 	iowrite32(T7XX_L1_BIT(0), IREG_BASE(t7xx_dev) + DISABLE_ASPM_LOWPWR);
@@ -739,8 +739,8 @@ static int t7xx_pci_pm_prepare(struct device *dev)
 
 	t7xx_dev = pci_get_drvdata(pdev);
 	if (!wait_for_completion_timeout(&t7xx_dev->init_done, T7XX_INIT_TIMEOUT * HZ)) {
-		dev_warn(dev, "Not ready for system sleep.\n");
-		return -ETIMEDOUT;
+		dev_warn(dev, "Not ready for system sleep, suspending anyway.\n");
+		return 0;
 	}
 
 	return 0;
