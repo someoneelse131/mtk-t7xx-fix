@@ -112,9 +112,15 @@ TimeoutStopSec=5
 EOF
 systemctl daemon-reload
 
-# Install systemd sleep hook to restart ModemManager after s2idle resume.
+# Install systemd sleep hook to restart ModemManager after resume.
 # The modem's MBIM session becomes stale after s2idle — MM doesn't know and
 # loops "Operation aborted" forever. Restarting MM forces a fresh MBIM_OPEN.
+#
+# suspend-then-hibernate fires the hook 4 times:
+#   pre(1) → suspend → wake → post(2) → pre(3) → hibernate → wake → post(4)
+# We must only restart MM at post(4), not post(2) — otherwise pre(3) kills
+# the pending restart <1s later and the driver enters hibernate mid-reprobe.
+# A flag file in /run (tmpfs, cleared on reboot) tracks the phase.
 SLEEP_HOOK="/usr/lib/systemd/system-sleep/99-modem-fix.sh"
 cat > "$SLEEP_HOOK" <<'HOOKEOF'
 #!/bin/bash
@@ -124,18 +130,34 @@ cat > "$SLEEP_HOOK" <<'HOOKEOF'
 #
 # Debug with:  journalctl -b | grep modem-fix
 LOG_TAG="modem-fix"
+STH_FLAG="/run/modem-fix-sth-phase"
 
 logger -t "$LOG_TAG" "hook called: action=$1 target=${2:-unknown}"
 
 case "$1" in
     pre)
         # Cancel any pending MM restart from a previous resume cycle.
-        # Without this, systemd-run fails with "Unit already loaded"
-        # on fast suspend/resume cycles and suspend-then-hibernate.
         systemctl stop modem-fix-resume 2>/dev/null || true
         systemctl reset-failed modem-fix-resume 2>/dev/null || true
+
+        if [[ "${2:-}" == "suspend-then-hibernate" ]]; then
+            if [ -f "$STH_FLAG" ]; then
+                # pre(3): about to hibernate — remove flag so post(4) proceeds
+                rm -f "$STH_FLAG"
+                logger -t "$LOG_TAG" "entering hibernate phase"
+            else
+                # pre(1): about to suspend — set flag to suppress post(2)
+                touch "$STH_FLAG"
+            fi
+        fi
         ;;
     post)
+        if [ -f "$STH_FLAG" ]; then
+            # post(2): intermediate wake between s2idle and hibernate — skip
+            logger -t "$LOG_TAG" "s2idle→hibernate transition, deferring MM restart"
+            exit 0
+        fi
+
         logger -t "$LOG_TAG" "resume detected, restarting ModemManager in 2s"
         systemd-run --no-block --unit=modem-fix-resume \
             bash -c 'sleep 2; systemctl restart ModemManager; logger -t modem-fix "ModemManager restart exit code: $?"'

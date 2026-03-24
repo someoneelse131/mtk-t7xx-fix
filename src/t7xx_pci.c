@@ -761,6 +761,28 @@ static int t7xx_pci_pm_thaw(struct device *dev)
 	return __t7xx_pci_pm_resume(to_pci_dev(dev), false);
 }
 
+static int t7xx_pci_pm_restore(struct device *dev)
+{
+	struct pci_dev *pdev = to_pci_dev(dev);
+	struct t7xx_pci_dev *t7xx_dev = pci_get_drvdata(pdev);
+
+	/* After hibernation the modem was power-cycled but the driver's
+	 * in-memory state was restored from the disk image.  If a reprobe
+	 * was in progress when we hibernated, md_pm_state is still
+	 * MTK_PM_INIT and init_done is incomplete — but the FSM thread
+	 * that would have finished that reprobe is gone (killed by the
+	 * freeze).  Bump the state to SUSPENDED so __t7xx_pci_pm_resume
+	 * reads the hardware registers and reprobes instead of skipping.
+	 */
+	if (atomic_read(&t7xx_dev->md_pm_state) <= MTK_PM_INIT) {
+		dev_info(&pdev->dev,
+			 "[PM] Restore: pm_state stuck at INIT, forcing reprobe\n");
+		atomic_set(&t7xx_dev->md_pm_state, MTK_PM_SUSPENDED);
+	}
+
+	return __t7xx_pci_pm_resume(pdev, true);
+}
+
 static int t7xx_pci_pm_runtime_suspend(struct device *dev)
 {
 	return __t7xx_pci_pm_suspend(to_pci_dev(dev));
@@ -780,7 +802,7 @@ static const struct dev_pm_ops t7xx_pci_pm_ops = {
 	.freeze = t7xx_pci_pm_suspend,
 	.thaw = t7xx_pci_pm_thaw,
 	.poweroff = t7xx_pci_pm_suspend,
-	.restore = t7xx_pci_pm_resume,
+	.restore = t7xx_pci_pm_restore,
 	.restore_noirq = t7xx_pci_pm_resume_noirq,
 	.runtime_suspend = t7xx_pci_pm_runtime_suspend,
 	.runtime_resume = t7xx_pci_pm_runtime_resume
