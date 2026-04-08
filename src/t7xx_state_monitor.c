@@ -46,6 +46,7 @@
 #define FSM_MD_EX_REC_OK_TIMEOUT_MS		10000
 #define FSM_MD_EX_PASS_TIMEOUT_MS		45000
 #define FSM_CMD_TIMEOUT_MS			2000
+#define FSM_PORT_ENUM_TIMEOUT_MS		30000
 
 #define wait_for_expected_dev_stage(status)	\
 	read_poll_timeout(ioread32, status,	\
@@ -413,8 +414,22 @@ static void fsm_routine_start(struct t7xx_fsm_ctl *ctl, struct t7xx_fsm_command 
 			dev_dbg(dev, "LINUX_STAGE Entered\n");
 			t7xx_mhccif_mask_clr(md->t7xx_dev, D2H_INT_PORT_ENUM |
 					     D2H_INT_ASYNC_MD_HK | D2H_INT_ASYNC_AP_HK);
-			if (cmd->flag == 0)
-				break;
+			if (cmd->flag == 0) {
+				u32 pending;
+
+				/* After reprobe the modem may have already sent
+				 * PORT_ENUM before we unmasked it.  If the bit
+				 * is pending in the status register but the
+				 * interrupt was never generated (edge-triggered
+				 * or masked at the time), we must detect it here
+				 * rather than waiting for an ISR that never fires.
+				 */
+				pending = t7xx_mhccif_read_sw_int_sts(
+						md->t7xx_dev);
+				if (!(pending & D2H_INT_PORT_ENUM))
+					break;
+				dev_info(dev, "PORT_ENUM already pending after reprobe\n");
+			}
 			t7xx_cldma_hif_hw_init(md->md_ctrl[CLDMA_ID_AP]);
 			t7xx_cldma_hif_hw_init(md->md_ctrl[CLDMA_ID_MD]);
 			t7xx_port_proxy_set_cfg(md, PORT_CFG_ID_NORMAL);
@@ -441,9 +456,36 @@ static int fsm_main_thread(void *data)
 	unsigned long flags;
 
 	while (!kthread_should_stop()) {
-		if (wait_event_interruptible(ctl->command_wq, !list_empty(&ctl->command_queue) ||
-					     kthread_should_stop()))
+		long timeout;
+		int ret;
+
+		/* In PRE_START the FSM is waiting for the modem to send
+		 * PORT_ENUM via interrupt.  Use a timeout so we don't
+		 * hang forever if the interrupt is lost or the modem
+		 * firmware is stuck.
+		 */
+		if (ctl->curr_state == FSM_STATE_PRE_START)
+			timeout = msecs_to_jiffies(FSM_PORT_ENUM_TIMEOUT_MS);
+		else
+			timeout = MAX_SCHEDULE_TIMEOUT;
+
+		ret = wait_event_interruptible_timeout(
+			ctl->command_wq,
+			!list_empty(&ctl->command_queue) ||
+			kthread_should_stop(),
+			timeout);
+
+		if (ret == -ERESTARTSYS)
 			continue;
+
+		if (ret == 0 && ctl->curr_state == FSM_STATE_PRE_START) {
+			dev_err(&ctl->md->t7xx_dev->pdev->dev,
+				"PORT_ENUM timeout (%d ms), retrying FSM start\n",
+				FSM_PORT_ENUM_TIMEOUT_MS);
+			t7xx_fsm_append_cmd(ctl, FSM_CMD_START,
+					    FSM_CMD_FLAG_IN_INTERRUPT);
+			continue;
+		}
 
 		if (kthread_should_stop())
 			break;

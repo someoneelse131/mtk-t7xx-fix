@@ -601,8 +601,19 @@ static int __t7xx_pci_pm_resume(struct pci_dev *pdev, bool state_check)
 			 prev_state, atr_reg_val, pdev->current_state);
 		if (prev_state == PM_RESUME_REG_STATE_L3 ||
 		    prev_state == PM_RESUME_REG_STATE_INIT) {
-			dev_info(&pdev->dev, "[PM] Resume: L3/INIT detected (prev_state=%u), reprobing\n",
-				 prev_state);
+			if (t7xx_dev->resume_reprobe_count >= MAX_RESUME_REPROBE_ATTEMPTS) {
+				dev_err(&pdev->dev,
+					"[PM] Resume: modem dead after %u reprobe attempts, giving up\n",
+					MAX_RESUME_REPROBE_ATTEMPTS);
+				complete_all(&t7xx_dev->init_done);
+				return 0;
+			}
+
+			t7xx_dev->resume_reprobe_count++;
+			dev_info(&pdev->dev,
+				 "[PM] Resume: L3/INIT detected (prev_state=%u), reprobe attempt %u/%u\n",
+				 prev_state, t7xx_dev->resume_reprobe_count,
+				 MAX_RESUME_REPROBE_ATTEMPTS);
 			ret = t7xx_pci_reprobe_early(t7xx_dev);
 			if (ret)
 				return ret;
@@ -739,8 +750,8 @@ static int t7xx_pci_pm_prepare(struct device *dev)
 
 	t7xx_dev = pci_get_drvdata(pdev);
 	if (!wait_for_completion_timeout(&t7xx_dev->init_done, T7XX_INIT_TIMEOUT * HZ)) {
-		dev_warn(dev, "Not ready for system sleep, suspending anyway.\n");
-		return 0;
+		dev_warn(dev, "Not ready for system sleep, blocking suspend.\n");
+		return -EBUSY;
 	}
 
 	return 0;
@@ -800,8 +811,10 @@ static const struct dev_pm_ops t7xx_pci_pm_ops = {
 	.resume = t7xx_pci_pm_resume,
 	.resume_noirq = t7xx_pci_pm_resume_noirq,
 	.freeze = t7xx_pci_pm_suspend,
+	.freeze_noirq = t7xx_pci_pm_suspend_noirq,
 	.thaw = t7xx_pci_pm_thaw,
 	.poweroff = t7xx_pci_pm_suspend,
+	.poweroff_noirq = t7xx_pci_pm_suspend_noirq,
 	.restore = t7xx_pci_pm_restore,
 	.restore_noirq = t7xx_pci_pm_resume_noirq,
 	.runtime_suspend = t7xx_pci_pm_runtime_suspend,
