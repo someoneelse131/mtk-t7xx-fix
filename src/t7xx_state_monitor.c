@@ -198,6 +198,12 @@ static void fsm_routine_exception(struct t7xx_fsm_ctl *ctl, struct t7xx_fsm_comm
 	switch (reason) {
 	case EXCEPTION_HS_TIMEOUT:
 		dev_err(dev, "Boot Handshake failure\n");
+		/* Async reprobe failed — unblock t7xx_pci_pm_prepare() so
+		 * subsequent system suspends don't hang forever with -EBUSY.
+		 * The modem is dead until reboot, but at least the laptop
+		 * can sleep and the user isn't stuck.
+		 */
+		complete_all(&ctl->md->t7xx_dev->init_done);
 		break;
 
 	case EXCEPTION_EVENT:

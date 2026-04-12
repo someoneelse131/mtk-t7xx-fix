@@ -614,6 +614,23 @@ static int __t7xx_pci_pm_resume(struct pci_dev *pdev, bool state_check)
 				 "[PM] Resume: L3/INIT detected (prev_state=%u), reprobe attempt %u/%u\n",
 				 prev_state, t7xx_dev->resume_reprobe_count,
 				 MAX_RESUME_REPROBE_ATTEMPTS);
+
+			/* If the PCIe link is still up (ATR window reads a
+			 * normal bus value, not the 0x7f "link down" pattern),
+			 * the modem firmware is stuck in INIT but the host
+			 * side is fine. A plain pcie_reinit won't reset the
+			 * firmware — we need a real HW reset via ACPI PLDR
+			 * (MRST._RST), which is the Lenovo-blessed path for
+			 * the FM350-GL. t7xx_reset_device() handles
+			 * save_state / reprobe_early / ACPI reset /
+			 * restore_state / reprobe internally.
+			 */
+			if (atr_reg_val != 0x0000007f) {
+				dev_info(&pdev->dev,
+					 "[PM] Resume: link up, using PLDR hard reset\n");
+				return t7xx_reset_device(t7xx_dev, PLDR);
+			}
+
 			ret = t7xx_pci_reprobe_early(t7xx_dev);
 			if (ret)
 				return ret;
