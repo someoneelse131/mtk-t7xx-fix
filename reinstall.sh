@@ -172,6 +172,9 @@ echo "Rebuilding initramfs..."
 dracut --force
 
 echo ""
-echo "=== Done! Rebooting in 3 seconds (Ctrl+C to cancel) ==="
-sleep 3
-reboot
+read -rp "=== Done! Reboot now? [y/N] " REPLY
+if [[ "$REPLY" =~ ^[Yy]$ ]]; then
+    reboot
+else
+    echo "Skipping reboot. Please reboot manually to load the new module."
+fi
