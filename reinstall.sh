@@ -116,11 +116,20 @@ systemctl daemon-reload
 # The modem's MBIM session becomes stale after s2idle — MM doesn't know and
 # loops "Operation aborted" forever. Restarting MM forces a fresh MBIM_OPEN.
 #
-# suspend-then-hibernate fires the hook 4 times:
-#   pre(1) → suspend → wake → post(2) → pre(3) → hibernate → wake → post(4)
-# We must only restart MM at post(4), not post(2) — otherwise pre(3) kills
-# the pending restart <1s later and the driver enters hibernate mid-reprobe.
-# A flag file in /run (tmpfs, cleared on reboot) tracks the phase.
+# suspend-then-hibernate only fires the hook 4 times (pre/post for suspend,
+# pre/post for hibernate) if hibernate ACTUALLY happens within the same
+# systemd-suspend-then-hibernate.service invocation. When the user wakes
+# from s2idle before the hibernate delay (the common case), only 2 hooks
+# fire and post IS the real wake.
+#
+# Design: always schedule MM restart on post with a short delay. On pre,
+# cancel any pending restart. For full STH (s2idle→hibernate→wake):
+#   post(2) schedules → pre(3) cancels before restart fires → post(4)
+#   schedules again → restart executes after resume.
+# For s2idle-only wake or plain suspend:
+#   post fires → restart executes after the delay, uninterrupted.
+# Observed post→pre gap inside a full STH cycle is ~140 ms, so a 3 s
+# delay gives a >20x safety margin for cancellation.
 SLEEP_HOOK="/usr/lib/systemd/system-sleep/99-modem-fix.sh"
 cat > "$SLEEP_HOOK" <<'HOOKEOF'
 #!/bin/bash
@@ -130,37 +139,28 @@ cat > "$SLEEP_HOOK" <<'HOOKEOF'
 #
 # Debug with:  journalctl -b | grep modem-fix
 LOG_TAG="modem-fix"
-STH_FLAG="/run/modem-fix-sth-phase"
 
 logger -t "$LOG_TAG" "hook called: action=$1 target=${2:-unknown}"
 
 case "$1" in
     pre)
-        # Cancel any pending MM restart from a previous resume cycle.
+        # Cancel any pending MM restart from the previous resume cycle.
+        # During a full suspend-then-hibernate chain, this fires as pre(3)
+        # after the intermediate post(2) and kills the in-flight restart
+        # before its sleep elapses, so the driver does not enter hibernate
+        # mid-reprobe. For plain suspend or s2idle-only wake it is a
+        # harmless no-op on an already-inactive unit.
         systemctl stop modem-fix-resume 2>/dev/null || true
         systemctl reset-failed modem-fix-resume 2>/dev/null || true
-
-        if [[ "${2:-}" == "suspend-then-hibernate" ]]; then
-            if [ -f "$STH_FLAG" ]; then
-                # pre(3): about to hibernate — remove flag so post(4) proceeds
-                rm -f "$STH_FLAG"
-                logger -t "$LOG_TAG" "entering hibernate phase"
-            else
-                # pre(1): about to suspend — set flag to suppress post(2)
-                touch "$STH_FLAG"
-            fi
-        fi
+        # Self-heal from a prior broken install that left its flag behind.
+        rm -f /run/modem-fix-sth-phase
         ;;
     post)
-        if [ -f "$STH_FLAG" ]; then
-            # post(2): intermediate wake between s2idle and hibernate — skip
-            logger -t "$LOG_TAG" "s2idle→hibernate transition, deferring MM restart"
-            exit 0
-        fi
-
-        logger -t "$LOG_TAG" "resume detected, restarting ModemManager in 2s"
+        # Schedule MM restart with a delay large enough to be cancelable
+        # by a follow-up pre (the STH intermediate wake case).
+        logger -t "$LOG_TAG" "resume detected, restarting ModemManager in 3s"
         systemd-run --no-block --unit=modem-fix-resume \
-            bash -c 'sleep 2; systemctl restart ModemManager; logger -t modem-fix "ModemManager restart exit code: $?"'
+            bash -c 'sleep 3; systemctl restart ModemManager; logger -t modem-fix "ModemManager restart exit code: $?"'
         ;;
 esac
 HOOKEOF
