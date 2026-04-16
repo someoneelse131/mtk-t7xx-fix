@@ -628,14 +628,20 @@ static int __t7xx_pci_pm_resume(struct pci_dev *pdev, bool state_check)
 			if (atr_reg_val != 0x0000007f) {
 				dev_info(&pdev->dev,
 					 "[PM] Resume: link up, using PLDR hard reset\n");
-				return t7xx_reset_device(t7xx_dev, PLDR);
+				ret = t7xx_reset_device(t7xx_dev, PLDR);
+				if (ret)
+					goto out_reprobe_failed;
+				return 0;
 			}
 
 			ret = t7xx_pci_reprobe_early(t7xx_dev);
 			if (ret)
 				return ret;
 
-			return t7xx_pci_reprobe(t7xx_dev, true);
+			ret = t7xx_pci_reprobe(t7xx_dev, true);
+			if (ret)
+				goto out_reprobe_failed;
+			return 0;
 		}
 
 		if (prev_state == PM_RESUME_REG_STATE_EXP ||
@@ -706,7 +712,10 @@ static int __t7xx_pci_pm_resume(struct pci_dev *pdev, bool state_check)
 		if (ret)
 			return ret;
 
-		return t7xx_pci_reprobe(t7xx_dev, true);
+		ret = t7xx_pci_reprobe(t7xx_dev, true);
+		if (ret)
+			goto out_reprobe_failed;
+		return 0;
 	}
 
 	if (t7xx_send_pm_request(t7xx_dev, H2D_CH_RESUME_REQ_AP))
@@ -728,6 +737,21 @@ static int __t7xx_pci_pm_resume(struct pci_dev *pdev, bool state_check)
 	atomic_set(&t7xx_dev->md_pm_state, MTK_PM_RESUMED);
 	t7xx_dev->resume_reprobe_count = 0;
 
+	return ret;
+
+out_reprobe_failed:
+	/* t7xx_pci_pm_reinit() ran as part of the failed reprobe path and
+	 * reset init_done via reinit_completion().  If we leave it reset,
+	 * every subsequent t7xx_pci_pm_prepare() blocks for 20 s and
+	 * returns -EBUSY, triggering a systemd suspend-retry loop that
+	 * eventually freezes the machine (observed April 9, boot -10;
+	 * required hard reset).  Unblock pm_prepare so the system can
+	 * still sleep even when the modem is dead until reboot — same
+	 * policy as the count >= MAX branch and EXCEPTION_HS_TIMEOUT.
+	 */
+	dev_err(&pdev->dev,
+		"[PM] Reprobe failed (%d), unblocking suspend path\n", ret);
+	complete_all(&t7xx_dev->init_done);
 	return ret;
 }
 
