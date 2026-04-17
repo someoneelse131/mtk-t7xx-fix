@@ -34,6 +34,7 @@
 #include <linux/pm_runtime.h>
 #include <linux/pm_wakeup.h>
 #include <linux/spinlock.h>
+#include <linux/suspend.h>
 
 #include "t7xx_mhccif.h"
 #include "t7xx_modem_ops.h"
@@ -606,6 +607,42 @@ static int __t7xx_pci_pm_resume(struct pci_dev *pdev, bool state_check)
 					"[PM] Resume: modem dead after %u reprobe attempts, giving up\n",
 					MAX_RESUME_REPROBE_ATTEMPTS);
 				complete_all(&t7xx_dev->init_done);
+				return 0;
+			}
+
+			/* PLDR uses ACPI MRST._RST to power-cycle the modem.
+			 * That is the only recovery path when the PCIe link is
+			 * still up (atr != 0x7f) and the modem firmware is
+			 * stuck in INIT — but it leaves the PCIe root complex
+			 * transiently unstable.
+			 *
+			 * Inside a system-sleep transition the kernel moves on
+			 * to the next stage within microseconds of this
+			 * callback returning (e.g. suspend-then-hibernate's
+			 * s2idle-wake runs .resume and then jumps straight into
+			 * hibernate() / sync_filesystems_hibernate()).  Running
+			 * PLDR in that window wedges NVMe I/O on the same root
+			 * complex indefinitely after
+			 * "PM: hibernation: hibernation entry" — observed
+			 * April 16 21:29; machine stayed at full power until
+			 * the battery drained, hard reset required.
+			 *
+			 * Defer PLDR when pm_suspend_target_state is non-zero:
+			 * mark the modem as not-ready (mode → UNKNOWN) so
+			 * __t7xx_pci_pm_suspend / .freeze skips its PM
+			 * handshake and suspend/hibernate can complete
+			 * cleanly with the modem dead-in-memory.  The next
+			 * resume after the full system wake will find
+			 * pm_suspend_target_state == PM_SUSPEND_ON again and
+			 * run PLDR normally.  Don't burn a retry slot here
+			 * since we didn't actually attempt the reset.
+			 */
+			if (atr_reg_val != 0x0000007f &&
+			    pm_suspend_target_state != PM_SUSPEND_ON) {
+				dev_warn(&pdev->dev,
+					 "[PM] Resume: L3/INIT + link up during system sleep (target=%d), deferring PLDR reset\n",
+					 pm_suspend_target_state);
+				t7xx_mode_update(t7xx_dev, T7XX_UNKNOWN);
 				return 0;
 			}
 
