@@ -817,8 +817,37 @@ static int t7xx_pci_pm_resume_noirq(struct device *dev)
 
 static void t7xx_pci_shutdown(struct pci_dev *pdev)
 {
+	struct t7xx_pci_dev *t7xx_dev = pci_get_drvdata(pdev);
+
+	/* At real system poweroff/reboot the modem loses power shortly and
+	 * a clean SAP handshake has no consumer.  If the modem's SAP side
+	 * is desynchronised ("[PM] SAP suspend timeout" / "[PM] SAP resume
+	 * timeout, continuing anyway"), __t7xx_pci_pm_suspend would still
+	 * run the full handshake on a half-dead modem and can wedge the
+	 * kernel in device_shutdown() — observed 2026-04-18 00:28, silent
+	 * wait (empty pstore), hard reset required.  c52a9aa added
+	 * t7xx_md_exit() to catch a different shutdown hang (TX thread
+	 * loop) but left __t7xx_pci_pm_suspend unconditional.
+	 *
+	 * Force mode to T7XX_UNKNOWN so __t7xx_pci_pm_suspend takes its
+	 * "modem not ready, skipping PM handshake" early-return and
+	 * t7xx_md_exit skips FSM_CMD_PRE_STOP.  Only local cleanup
+	 * (CLDMA stop with 1 s poll, port-proxy uninit, workqueue
+	 * destroy, TX-thread kthread_stop) runs — no modem-side I/O.
+	 * Mirrors the approach of 5305cb5 (hibernate PLDR defer).
+	 *
+	 * Only apply inside the real poweroff/reboot/halt window — PCI
+	 * .shutdown is currently only invoked from kernel_power_off() /
+	 * kernel_restart() / kernel_halt(), but guard defensively against
+	 * future kernel changes that might route other contexts here.
+	 */
+	if (system_state == SYSTEM_POWER_OFF ||
+	    system_state == SYSTEM_RESTART ||
+	    system_state == SYSTEM_HALT)
+		t7xx_mode_update(t7xx_dev, T7XX_UNKNOWN);
+
 	__t7xx_pci_pm_suspend(pdev);
-	t7xx_md_exit(pci_get_drvdata(pdev));
+	t7xx_md_exit(t7xx_dev);
 }
 
 static int t7xx_pci_pm_prepare(struct device *dev)
