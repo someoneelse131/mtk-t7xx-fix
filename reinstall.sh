@@ -7,15 +7,17 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 MODULE_NAME="mtk_t7xx"
-MODULE_VERSION="1.1.2"
+MODULE_VERSION="1.1.3"
 DKMS_DIR="/usr/src/${MODULE_NAME}-${MODULE_VERSION}"
 BLACKLIST_CONF="/etc/modprobe.d/blacklist-mtk-t7xx.conf"
 KVER="$(uname -r)"
 SKIP_BUILD=0
+ASSUME_YES=0
 
 for arg in "$@"; do
     case "$arg" in
         --skip-build) SKIP_BUILD=1 ;;
+        -y|--yes) ASSUME_YES=1 ;;
     esac
 done
 
@@ -35,9 +37,13 @@ if ! grep -q 'iommu=pt' /proc/cmdline; then
     echo ""
     echo "    sudo grubby --update-kernel=ALL --args=\"iommu=pt\""
     echo ""
-    read -rp "Continue anyway? [y/N] " ans
-    if [[ ! "$ans" =~ ^[Yy]$ ]]; then
-        exit 1
+    if [ "$ASSUME_YES" -eq 1 ]; then
+        echo "[-y] continuing without iommu=pt."
+    else
+        read -rp "Continue anyway? [y/N] " ans
+        if [[ ! "$ans" =~ ^[Yy]$ ]]; then
+            exit 1
+        fi
     fi
 fi
 
@@ -55,7 +61,9 @@ fi
 # --- Install (needs root) ---
 if [ "$EUID" -ne 0 ]; then
     echo "Build succeeded. Elevating for install..."
-    exec sudo bash "$SCRIPT_DIR/reinstall.sh" --skip-build
+    REEXEC_ARGS=(--skip-build)
+    [ "$ASSUME_YES" -eq 1 ] && REEXEC_ARGS+=(-y)
+    exec sudo bash "$SCRIPT_DIR/reinstall.sh" "${REEXEC_ARGS[@]}"
 fi
 
 echo "=== Installing via DKMS ==="
@@ -101,14 +109,17 @@ for svc in fibo_helper.service fibo_flash.service fwswitch.service lenovo-cfgser
     systemctl disable --now "$svc" 2>/dev/null || true
 done
 
-# Cap ModemManager stop timeout at 5 seconds. MM gets stuck reprobing the
+# Cap ModemManager stop timeout at 10 seconds. MM gets stuck reprobing the
 # modem during shutdown and blocks for the full default 45s until SIGABRT.
+# 10 s gives libmbim enough time to abort a mid-flight MBIM transaction
+# cleanly (observed SIGABRT at T+5.000s when cap was 5 s; bumped to 10 s
+# on 2026-04-21 — still beats the 45 s shutdown-hang threshold).
 MM_DROPIN_DIR="/etc/systemd/system/ModemManager.service.d"
 MM_DROPIN="${MM_DROPIN_DIR}/quick-stop.conf"
 mkdir -p "$MM_DROPIN_DIR"
 cat > "$MM_DROPIN" <<'EOF'
 [Service]
-TimeoutStopSec=5
+TimeoutStopSec=10
 EOF
 systemctl daemon-reload
 
@@ -314,9 +325,14 @@ echo "Rebuilding initramfs..."
 dracut --force
 
 echo ""
-read -rp "=== Done! Reboot now? [y/N] " REPLY
-if [[ "$REPLY" =~ ^[Yy]$ ]]; then
+if [ "$ASSUME_YES" -eq 1 ]; then
+    echo "[-y] Rebooting now..."
     reboot
 else
-    echo "Skipping reboot. Please reboot manually to load the new module."
+    read -rp "=== Done! Reboot now? [y/N] " REPLY
+    if [[ "$REPLY" =~ ^[Yy]$ ]]; then
+        reboot
+    else
+        echo "Skipping reboot. Please reboot manually to load the new module."
+    fi
 fi
