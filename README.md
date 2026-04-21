@@ -113,10 +113,17 @@ All of this is idempotent -- safe to run repeatedly.
 ## Uninstall
 
 ```bash
-sudo bash uninstall.sh
-sudo grubby --update-kernel=ALL --remove-args="iommu=pt"
-sudo reboot
+sudo bash uninstall.sh        # interactive
+sudo bash uninstall.sh -y     # non-interactive, auto-reboot
 ```
+
+Removes every installed DKMS version, the sleep hooks, the FCC
+unlock script, and the ModemManager drop-in. Leaves Fibocom services
+disabled for safety. Prompts before removing `iommu=pt`.
+
+For the full inventory of what was installed, the warnings about
+downgrading to the in-tree driver, a manual fallback if the script
+fails, and troubleshooting: see [`docs/uninstall.md`](docs/uninstall.md).
 
 ## Troubleshooting
 
