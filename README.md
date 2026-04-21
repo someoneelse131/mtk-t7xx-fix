@@ -8,7 +8,7 @@ Related Fedora discussion: [Issue activating mobile internet modem on a Lenovo T
 
 ## The problem
 
-On Fedora 43 the in-tree `mtk_t7xx` driver fails to initialize the modem. Nine separate issues stack up:
+On Fedora 43 the in-tree `mtk_t7xx` driver fails to initialize the modem. Multiple issues stack up:
 
 1. **PM timeout treated as fatal** -- the modem's PCIe power-management status register never becomes ready. The driver aborts instead of continuing without PM.
 2. **NULL pointer crash (double-uninit)** -- the error-recovery path calls `kthread_stop()` twice on the same thread without NULLing the pointer.
@@ -19,10 +19,14 @@ On Fedora 43 the in-tree `mtk_t7xx` driver fails to initialize the modem. Nine s
 7. **s2idle sleep kills the connection** -- after resume the modem's MBIM session is stale but ModemManager doesn't know, so it loops "Operation aborted" forever.
 8. **Dead modem after sleep** -- the modem firmware sometimes reboots during s2idle. The ATR register retains a stale valid value, so the driver skips reprobing and attempts a normal handshake resume. The SAP channel times out but the driver continues anyway, leaving the modem in a zombie state where all communication fails.
 9. **Infinite reprobe loop freezes system** -- the fix for issue 8 unconditionally reprobed on SAP resume timeout, but this also triggers during normal L1 runtime PM resumes (e.g. when the modem is rfkill-blocked). The reprobe restarts the modem, runtime PM re-enables, the same timeout recurs, creating an infinite loop. After ~10 minutes of repeated reprobes, kernel memory is corrupted, causing a General Protection Fault, RCU stall, and total system freeze requiring a hard reboot.
+10. **Dead modem after s2idle wake (v1.1.3)** -- the hibernate-hang fix introduced in v1.1.2 deferred a PLDR reset to avoid wedging NVMe during hibernate entry, assuming a later resume callback would run it. That assumption only held when STH continued into hibernate. If the user woke from s2idle before the hibernate delay, no later callback ran and the modem stayed in L3/INIT with every port write returning EIO — only a cold reboot recovered.
 
 The same hardware works fine on Ubuntu (kernel 6.14) because it uses IOMMU passthrough and doesn't ship the Lenovo services.
 
-All nine issues are fixed by this project -- seven driver patches (across three source files), plus system-level fixes handled by the install script.
+All issues are fixed by this project -- driver patches (across three source files), plus system-level fixes handled by the install script.
+
+For the full history of what was tried, what regressed, and why each fix
+exists, see [`docs/journal.md`](docs/journal.md).
 
 ## Quick start
 
@@ -41,7 +45,15 @@ cd mtk-t7xx-fix
 bash reinstall.sh
 ```
 
-The script will build the module as your user, then `sudo` for the install step. After install it reboots automatically (Ctrl+C to cancel).
+The script will build the module as your user, then `sudo` for the install step. After install it prompts for confirmation before rebooting.
+
+**Non-interactive mode.** Pass `-y` / `--yes` to skip both prompts
+(the `iommu=pt` warning and the reboot confirmation). Useful for
+scripting:
+
+```bash
+bash reinstall.sh -y
+```
 
 ## After reboot
 
@@ -87,7 +99,7 @@ All of this is idempotent -- safe to run repeatedly.
 4. Installs ModemManager's AT-based FCC unlock script (replaces the crashing Lenovo binary)
 5. Installs `xxd` if missing (needed by the FCC unlock script)
 6. Disables Lenovo Fibocom services that force the modem into fastboot
-7. Adds a systemd drop-in to cap ModemManager's stop timeout at 5 s (it hangs for 45 s otherwise)
+7. Adds a systemd drop-in to cap ModemManager's stop timeout at 10 s (it hangs for 45 s otherwise)
 8. Installs a systemd sleep hook to restart ModemManager after resume (fixes stale MBIM session)
 9. Rebuilds initramfs and reboots
 
@@ -178,6 +190,10 @@ The patched driver source lives in `src/`. Key changes:
 | `t7xx_pci.c` | SAP resume timeout triggers reprobe only when modem rebooted (`prev_state=INIT`), non-fatal for normal L1/L2 resumes |
 | `t7xx_pci.c` | Resume reprobe attempts capped at 3 to prevent infinite loop, counter resets on successful resume |
 | `t7xx_pci.c` | Shutdown calls `t7xx_md_exit()` after suspend to stop the TX thread and prevent the poweroff hang |
+| `t7xx_pci.c` | Shutdown forces `mode=UNKNOWN` on poweroff/reboot so the PM handshake is skipped against a desynchronised SAP |
+| `t7xx_pci.c` | Hibernate entry defers PLDR when PCIe link is still up (avoids NVMe wedge), with a `delayed_work` follow-up that actually runs the deferred reset after resume completes (covers the s2idle-wake-only path) |
 | `t7xx_port_ctrl_msg.c` | NULL `port->thread` after `kthread_stop()` (prevents double-uninit crash) |
 | `t7xx_port_ctrl_msg.c` | NULL `port->thread` on `kthread_run()` failure (prevents ERR_PTR dereference) |
 | `t7xx_state_monitor.c` | Device-stage timeout increased to 60 s |
+
+Full per-commit reasoning and timeline in [`docs/journal.md`](docs/journal.md).
