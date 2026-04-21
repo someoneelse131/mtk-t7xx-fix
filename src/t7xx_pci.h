@@ -23,6 +23,7 @@
 #include <linux/pci.h>
 #include <linux/spinlock.h>
 #include <linux/types.h>
+#include <linux/workqueue.h>
 
 #include "t7xx_reg.h"
 
@@ -69,6 +70,9 @@ enum t7xx_mode {
  * @md_pm_lock: protects PCIe sleep lock
  * @sleep_disable_count: PCIe L1.2 lock counter
  * @sleep_lock_acquire: indicates that sleep has been disabled
+ * @deferred_pldr_work: worker that runs a deferred PLDR reset after resume
+ *                     completes (covers the s2idle-wake path where no further
+ *                     resume callback would otherwise occur)
  * @mode: indicates the device mode
  */
 struct t7xx_pci_dev {
@@ -91,6 +95,7 @@ struct t7xx_pci_dev {
 	unsigned int		sleep_disable_count;
 	unsigned int		resume_reprobe_count;
 	struct completion	sleep_lock_acquire;
+	struct delayed_work	deferred_pldr_work;
 #ifdef CONFIG_WWAN_DEBUGFS
 	struct dentry		*debugfs_dir;
 #endif

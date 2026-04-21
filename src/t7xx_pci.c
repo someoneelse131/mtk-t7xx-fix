@@ -35,6 +35,7 @@
 #include <linux/pm_wakeup.h>
 #include <linux/spinlock.h>
 #include <linux/suspend.h>
+#include <linux/workqueue.h>
 
 #include "t7xx_mhccif.h"
 #include "t7xx_modem_ops.h"
@@ -56,6 +57,8 @@
 #define PM_RESOURCE_POLL_TIMEOUT_US	500000
 #define PM_RESOURCE_POLL_STEP_US	1000
 #define MAX_RESUME_REPROBE_ATTEMPTS	3
+#define DEFERRED_PLDR_DELAY_MS		3000
+#define DEFERRED_PLDR_RETRY_MS		2000
 
 static const char * const t7xx_mode_names[] = {
 	[T7XX_UNKNOWN] = "unknown",
@@ -225,6 +228,104 @@ static int t7xx_wait_pm_config(struct t7xx_pci_dev *t7xx_dev)
 	return 0;
 }
 
+static void t7xx_deferred_pldr_worker(struct work_struct *work)
+{
+	struct t7xx_pci_dev *t7xx_dev =
+		container_of(to_delayed_work(work), struct t7xx_pci_dev,
+			     deferred_pldr_work);
+	struct pci_dev *pdev = t7xx_dev->pdev;
+	u32 atr_reg_val;
+	int ret;
+
+	/* If the system re-entered suspend (STH → hibernate leg, or a
+	 * fresh user-triggered suspend landed on top of our wake), defer
+	 * again.  Running PLDR mid-suspend pulls ACPI MRST._RST and wedges
+	 * the PCIe root complex, which is exactly the hazard 5305cb5
+	 * was avoiding in the first place.
+	 */
+	if (pm_suspend_target_state != PM_SUSPEND_ON) {
+		dev_info(&pdev->dev,
+			 "[PM] Deferred PLDR: system sleeping (target=%d), rescheduling\n",
+			 pm_suspend_target_state);
+		schedule_delayed_work(&t7xx_dev->deferred_pldr_work,
+				      msecs_to_jiffies(DEFERRED_PLDR_RETRY_MS));
+		return;
+	}
+
+	/* If another resume path already recovered the modem (hibernate
+	 * .restore, or a second user-suspend/resume round that took the
+	 * reprobe branch), do not PLDR a working modem.
+	 */
+	if (READ_ONCE(t7xx_dev->mode) != T7XX_UNKNOWN) {
+		dev_info(&pdev->dev,
+			 "[PM] Deferred PLDR: mode already %u, skipping\n",
+			 READ_ONCE(t7xx_dev->mode));
+		return;
+	}
+
+	/* Take a runtime-PM reference before touching hardware.  Between
+	 * the defer (modem in L3/INIT, mode=UNKNOWN) and this worker,
+	 * runtime-PM may have decided to autosuspend the device.  PLDR on
+	 * a runtime-suspended PCI device is undefined (config space PM
+	 * mismatch).  pm_runtime_get_sync wakes the device if needed, and
+	 * we release the ref after PLDR completes.
+	 */
+	ret = pm_runtime_get_sync(&pdev->dev);
+	if (ret < 0) {
+		dev_warn(&pdev->dev,
+			 "[PM] Deferred PLDR: pm_runtime_get_sync failed (%d), aborting\n",
+			 ret);
+		pm_runtime_put_noidle(&pdev->dev);
+		complete_all(&t7xx_dev->init_done);
+		return;
+	}
+
+	/* If the PCIe link dropped since the deferral (atr reads 0x7f),
+	 * this is now the L3 "clean" path where a plain pcie_reinit would
+	 * work.  Leaving it to the next resume callback keeps the retry
+	 * accounting honest and avoids a needless PLDR.
+	 */
+	atr_reg_val = ioread32(IREG_BASE(t7xx_dev) +
+			       ATR_PCIE_WIN0_T0_ATR_PARAM_SRC_ADDR);
+	if (atr_reg_val == 0x0000007f) {
+		dev_info(&pdev->dev,
+			 "[PM] Deferred PLDR: link down since defer, leaving to resume path\n");
+		pm_runtime_put(&pdev->dev);
+		return;
+	}
+
+	if (t7xx_dev->resume_reprobe_count >= MAX_RESUME_REPROBE_ATTEMPTS) {
+		dev_err(&pdev->dev,
+			"[PM] Deferred PLDR: modem dead after %u attempts, giving up\n",
+			MAX_RESUME_REPROBE_ATTEMPTS);
+		complete_all(&t7xx_dev->init_done);
+		pm_runtime_put(&pdev->dev);
+		return;
+	}
+
+	t7xx_dev->resume_reprobe_count++;
+	dev_info(&pdev->dev,
+		 "[PM] Deferred PLDR: running now, attempt %u/%u\n",
+		 t7xx_dev->resume_reprobe_count, MAX_RESUME_REPROBE_ATTEMPTS);
+
+	ret = t7xx_reset_device(t7xx_dev, PLDR);
+	if (ret) {
+		dev_err(&pdev->dev,
+			"[PM] Deferred PLDR failed: %d, unblocking suspend path\n",
+			ret);
+		complete_all(&t7xx_dev->init_done);
+	} else {
+		/* Mirror the zero-on-success convention of the main
+		 * resume path at __t7xx_pci_pm_resume (line ~775).
+		 * Without this, a subsequent L3/INIT resume would see a
+		 * stale non-zero count and prematurely hit the MAX cap.
+		 */
+		t7xx_dev->resume_reprobe_count = 0;
+	}
+
+	pm_runtime_put(&pdev->dev);
+}
+
 static int t7xx_pci_pm_init(struct t7xx_pci_dev *t7xx_dev)
 {
 	struct pci_dev *pdev = t7xx_dev->pdev;
@@ -236,6 +337,8 @@ static int t7xx_pci_pm_init(struct t7xx_pci_dev *t7xx_dev)
 	init_completion(&t7xx_dev->pm_sr_ack);
 	init_completion(&t7xx_dev->init_done);
 	atomic_set(&t7xx_dev->md_pm_state, MTK_PM_INIT);
+	INIT_DELAYED_WORK(&t7xx_dev->deferred_pldr_work,
+			  t7xx_deferred_pldr_worker);
 
 	device_init_wakeup(&pdev->dev, true);
 	dev_pm_set_driver_flags(&pdev->dev, pdev->dev.power.driver_flags |
@@ -427,6 +530,15 @@ static int __t7xx_pci_pm_suspend(struct pci_dev *pdev)
 	int ret;
 
 	t7xx_dev = pci_get_drvdata(pdev);
+
+	/* Do not let a deferred PLDR fire while we are trying to suspend.
+	 * cancel_delayed_work_sync waits for an in-flight worker to
+	 * finish.  This is bounded (PLDR + reprobe ≤ T7XX_INIT_TIMEOUT)
+	 * and safe: the worker holds no lock that this callback path
+	 * needs.
+	 */
+	cancel_delayed_work_sync(&t7xx_dev->deferred_pldr_work);
+
 	if (atomic_read(&t7xx_dev->md_pm_state) <= MTK_PM_INIT ||
 	    READ_ONCE(t7xx_dev->mode) != T7XX_READY) {
 		dev_warn(&pdev->dev, "[PM] Suspend: modem not ready, skipping PM handshake\n");
@@ -586,6 +698,13 @@ static int __t7xx_pci_pm_resume(struct pci_dev *pdev, bool state_check)
 	int ret = 0;
 
 	t7xx_dev = pci_get_drvdata(pdev);
+
+	/* A new resume callback supersedes any pending deferred PLDR.
+	 * Cancel before re-evaluating state so the worker cannot run
+	 * concurrently with this callback's reprobe.
+	 */
+	cancel_delayed_work_sync(&t7xx_dev->deferred_pldr_work);
+
 	if (atomic_read(&t7xx_dev->md_pm_state) <= MTK_PM_INIT) {
 		dev_info(&pdev->dev, "[PM] Resume: skipped, pm_state <= INIT\n");
 		iowrite32(T7XX_L1_BIT(0), IREG_BASE(t7xx_dev) + ENABLE_ASPM_LOWPWR);
@@ -643,6 +762,14 @@ static int __t7xx_pci_pm_resume(struct pci_dev *pdev, bool state_check)
 					 "[PM] Resume: L3/INIT + link up during system sleep (target=%d), deferring PLDR reset\n",
 					 pm_suspend_target_state);
 				t7xx_mode_update(t7xx_dev, T7XX_UNKNOWN);
+				/* Schedule the reset for after PM machinery
+				 * returns to PM_SUSPEND_ON.  The worker
+				 * reschedules itself if the system is still
+				 * sleeping (STH hibernate leg) and bails if a
+				 * normal resume path recovers the modem first.
+				 */
+				schedule_delayed_work(&t7xx_dev->deferred_pldr_work,
+						      msecs_to_jiffies(DEFERRED_PLDR_DELAY_MS));
 				return 0;
 			}
 
@@ -819,6 +946,8 @@ static void t7xx_pci_shutdown(struct pci_dev *pdev)
 {
 	struct t7xx_pci_dev *t7xx_dev = pci_get_drvdata(pdev);
 
+	cancel_delayed_work_sync(&t7xx_dev->deferred_pldr_work);
+
 	/* At real system poweroff/reboot the modem loses power shortly and
 	 * a clean SAP handshake has no consumer.  If the modem's SAP side
 	 * is desynchronised ("[PM] SAP suspend timeout" / "[PM] SAP resume
@@ -856,6 +985,14 @@ static int t7xx_pci_pm_prepare(struct device *dev)
 	struct t7xx_pci_dev *t7xx_dev;
 
 	t7xx_dev = pci_get_drvdata(pdev);
+
+	/* .prepare is the earliest PM callback — cancel any pending
+	 * deferred PLDR before waiting on init_done.  Otherwise a worker
+	 * scheduled in a previous resume might fire between our .prepare
+	 * and .suspend, racing the suspend freezer.
+	 */
+	cancel_delayed_work_sync(&t7xx_dev->deferred_pldr_work);
+
 	if (!wait_for_completion_timeout(&t7xx_dev->init_done, T7XX_INIT_TIMEOUT * HZ)) {
 		dev_warn(dev, "Not ready for system sleep, blocking suspend.\n");
 		return -EBUSY;
@@ -1109,6 +1246,8 @@ static void t7xx_pci_remove(struct pci_dev *pdev)
 	int i;
 
 	t7xx_dev = pci_get_drvdata(pdev);
+
+	cancel_delayed_work_sync(&t7xx_dev->deferred_pldr_work);
 
 	sysfs_remove_group(&t7xx_dev->pdev->dev.kobj,
 			   &t7xx_attribute_group);
