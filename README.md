@@ -28,6 +28,22 @@ All issues are fixed by this project -- driver patches (across three source file
 For the full history of what was tried, what regressed, and why each fix
 exists, see [`docs/journal.md`](docs/journal.md).
 
+## Disclaimer
+
+This project patches an in-tree kernel driver and modifies system-level
+services (ModemManager, systemd sleep hooks, Lenovo Fibocom services).
+It has been stable on the hardware and kernel listed above, but
+kernel-mode bugs can always crash the system or, in rare cases, lead to
+data loss.
+
+**Use at your own risk.** I accept no liability for any damage, data
+loss, hardware issues, or other consequences arising from installing or
+running any part of this project. By running the scripts or loading the
+patched module you agree that you do so on your own responsibility.
+
+If anything here is unclear, read the scripts and patches before
+running them — everything is plain shell and a few hundred lines of C.
+
 ## Quick start
 
 ```bash
