@@ -1020,22 +1020,58 @@ static int t7xx_pci_pm_restore(struct device *dev)
 {
 	struct pci_dev *pdev = to_pci_dev(dev);
 	struct t7xx_pci_dev *t7xx_dev = pci_get_drvdata(pdev);
+	int ret;
 
-	/* After hibernation the modem was power-cycled but the driver's
-	 * in-memory state was restored from the disk image.  If a reprobe
-	 * was in progress when we hibernated, md_pm_state is still
-	 * MTK_PM_INIT and init_done is incomplete — but the FSM thread
-	 * that would have finished that reprobe is gone (killed by the
-	 * freeze).  Bump the state to SUSPENDED so __t7xx_pci_pm_resume
-	 * reads the hardware registers and reprobes instead of skipping.
+	/* Across S4 the modem firmware is power-cycled but the driver's
+	 * in-memory CLDMA ring state (tx_next / tr_done / pending GPDs)
+	 * is restored from the hibernation image.  The HS1/HS2 handshake
+	 * runs over MHCCIF and completes cleanly even when those ring
+	 * pointers no longer match the hardware queue pointers, so the
+	 * plain reprobe path can leave the modem looking healthy
+	 * (md_pm_state=RESUMED, mode=READY) while every MBIM transaction
+	 * times out.  Force a chip-level PLDR on .restore so the firmware
+	 * boots fresh AND the subsequent reprobe rebuilds CLDMA state from
+	 * scratch.  Safe here because .restore runs after hibernation_exit
+	 * (pm_suspend_target_state == PM_SUSPEND_ON), so the April-16
+	 * NVMe-wedge scenario that motivated commit 5305cb5 does not apply.
 	 */
-	if (atomic_read(&t7xx_dev->md_pm_state) <= MTK_PM_INIT) {
-		dev_info(&pdev->dev,
-			 "[PM] Restore: pm_state stuck at INIT, forcing reprobe\n");
+
+	/* Match every other PM entry point (see lines 552, 718, 986, 1031): a
+	 * deferred PLDR worker scheduled before .freeze must not race the
+	 * synchronous PLDR we are about to run.
+	 */
+	cancel_delayed_work_sync(&t7xx_dev->deferred_pldr_work);
+
+	if (atomic_read(&t7xx_dev->md_pm_state) <= MTK_PM_INIT)
 		atomic_set(&t7xx_dev->md_pm_state, MTK_PM_SUSPENDED);
+
+	if (t7xx_dev->resume_reprobe_count >= MAX_RESUME_REPROBE_ATTEMPTS) {
+		dev_err(&pdev->dev,
+			"[PM] Restore: modem dead after %u attempts, giving up\n",
+			MAX_RESUME_REPROBE_ATTEMPTS);
+		/* Unblock .prepare so the next suspend cycle isn't held up
+		 * 20 s by wait_for_completion_timeout(&init_done) — that was
+		 * the e22d499 / April-9 systemd suspend-retry regression.
+		 */
+		complete_all(&t7xx_dev->init_done);
+		return 0;
+	}
+	t7xx_dev->resume_reprobe_count++;
+
+	dev_info(&pdev->dev, "[PM] Restore: forcing PLDR (attempt %u/%u)\n",
+		 t7xx_dev->resume_reprobe_count, MAX_RESUME_REPROBE_ATTEMPTS);
+
+	ret = t7xx_reset_device(t7xx_dev, PLDR);
+	if (ret) {
+		dev_err(&pdev->dev,
+			"[PM] Restore: PLDR failed (%d), unblocking suspend path\n",
+			ret);
+		complete_all(&t7xx_dev->init_done);
+		return ret;
 	}
 
-	return __t7xx_pci_pm_resume(pdev, true);
+	t7xx_dev->resume_reprobe_count = 0;
+	return 0;
 }
 
 static int t7xx_pci_pm_runtime_suspend(struct device *dev)

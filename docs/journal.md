@@ -21,6 +21,199 @@ suspend-then-hibernate on lid-close (KDE + logind drop-in).
 
 ---
 
+## 2026-05-05 — Always-PLDR on `.restore` (Option B)
+
+**Symptom.** After STH cycles that fully transition to S4, the
+post-resume `mtk_t7xx` plain-reprobe path sometimes leaves the modem
+in a state where the MD handshake reports success
+(`md_pm_state=MTK_PM_RESUMED`, `mode=T7XX_READY`, `init_done`
+signalled) but every MBIM transaction times out. ModemManager hits
+`transaction_timed_out`, SIGABRTs, respawns ~36 s later, crashes the
+same way, repeats until reboot. WiFi etc. fine — only mobile data.
+
+**Hergang (Boot -1, 2026-05-05).** STH cycle 3 transitioned to S4 at
+07:51:23. S4 wake at 08:01:38 (10 min in S4) → `atr=0x7f`, plain
+reprobe path. Driver logs the smoking-gun
+`mtk_t7xx 0000:08:00.0: CLDMA1 queue 0 is not empty`. NO subsequent
+`[PM] Resume: handshake path` ever appears. From 08:02:59 onward MM
+SIGABRTs every ~36 s (8 crashes total) until user issued a clean
+`systemctl shutdown` at 08:07:50. Same crash signature already seen
+on 2026-05-02 (8 SIGABRTs after 5h21m S4) and 2026-05-04 (1 SIGABRT
+at end of boot -2).
+
+**Root cause.** The HS1/HS2 handshake uses MHCCIF (register-based
+interrupts), not CLDMA. So the handshake completes cleanly while the
+driver's in-memory CLDMA ring SW state (`tx_next`, `tr_done`,
+pending GPDs) is whatever was restored from the hibernate image —
+stale relative to the firmware's hardware queue pointers, which are
+fresh from cold boot. `t7xx_cldma_txq_empty_hndl` in
+`src/t7xx_hif_cldma.c` reads `REG_CLDMA_UL_CURRENT_ADDRL_0`,
+compares to the GPD it expects to be "current", and bails when they
+disagree — that's the `CLDMA1 queue 0 is not empty` warning. After
+that point every TX/RX is desynchronised. Race / timing, not a
+duration threshold (16 h S4 worked, 10 min S4 failed in the same
+week).
+
+**Why a `md_pm_state` watchdog (Option A) was rejected.** The
+handshake completes via MHCCIF and `md_pm_state` reaches
+`MTK_PM_RESUMED` even when CLDMA is broken, so a
+"watch pm_state, escalate if stuck" watchdog never fires. To catch
+this it would need CLDMA-level health probing — nearly as complex
+as the deeper fix and still has corner cases.
+
+**Fix.** Force a chip-level PLDR on every `.restore`. PLDR runs
+ACPI `MRST._RST` which resets the firmware AND the subsequent
+`t7xx_pci_reprobe(boot=true)` rebuilds CLDMA SW state from scratch,
+so hardware and SW agree. Scoped to `.restore` only — `.resume`,
+`.thaw`, `.runtime_resume` keep their existing fast plain-reprobe
+behavior. Safe in `.restore` because `pm_suspend_target_state ==
+PM_SUSPEND_ON` (we're past `hibernation_exit`), so the April-16
+NVMe-wedge scenario that 5305cb5 was protecting against does not
+apply.
+
+`t7xx_pci_pm_restore` now:
+
+1. `cancel_delayed_work_sync(&deferred_pldr_work)` at top — every
+   other PM entry already does this; `.restore` was the only
+   omission.
+2. Bumps `md_pm_state` from `≤MTK_PM_INIT` to `MTK_PM_SUSPENDED`
+   (preserved from previous behavior, harmless before PLDR).
+3. Caps at `MAX_RESUME_REPROBE_ATTEMPTS = 3` — counts attempts,
+   gives up after 3, `complete_all(&init_done)` so
+   `.prepare` doesn't block 20 s and trigger the
+   suspend-retry loop (the e22d499 / April-9 regression).
+4. `t7xx_reset_device(t7xx_dev, PLDR)`. On failure same
+   `complete_all(&init_done)` unblock so suspend can still proceed
+   with a dead modem.
+5. Counter zeroed only on success — same convention as
+   `t7xx_deferred_pldr_worker`.
+
+**Trade-off.** ~5–10 s extra latency on every hibernate-resume
+(PLDR is just an ACPI call + reprobe), on top of the existing
+35 s post-resume MM-restart delay the user already sees. Acceptable
+in exchange for catching every CLDMA-ring-desync incident.
+
+**Verification.** Build clean against kernel 6.19.14 out-of-tree.
+Runtime verification deferred to user — plan:
+
+```bash
+sudo systemctl suspend-then-hibernate
+# wait 10+ min for HibernateDelaySec, then power button or lid
+journalctl -k -b | grep -E '\[PM\] Restore|forcing PLDR|MRST'
+# Expected: "[PM] Restore: forcing PLDR (attempt 1/3)" once per S4 wake
+# Expected: NO "CLDMA1 queue 0 is not empty"
+mmcli -m 0 | grep state
+# Expected: connected within ~40 s of wake
+```
+
+Repeat for 2 min, 10 min, 1 h, 8 h S4. Each should succeed without
+modem death.
+
+Full root-cause investigation in
+`docs/superpowers/2026-05-05-investigation.md` (parallel agent
+review producing the reviewed code sketch this commit applied).
+
+---
+
+## 2026-04-28 — `keepalive_s2idle` option for fast s2idle wake
+
+**Symptom (none — feature, not bug).** After every lid-open the user
+waits 45–66 s before mobile data is back. Profile of three consecutive
+s2idle cycles (Boot 0, 16:33 / 16:49 / 17:00):
+
+| Δt from suspend exit | Event |
+|---|---|
+| +0 s  | `PM: suspend exit` |
+| +3 s  | `Deferred PLDR: running now, attempt 1/3` |
+| +5 s  | `PM configuration timed out — continuing without full PM support` |
+| +19 s | `PORT_ENUM already pending after reprobe` |
+| +25–30 s | repeated `Packet drop on channel 0x1004 / 0x1012, port not found` |
+| +35 s | `99-modem-fix.sh` timer fires, `systemctl restart ModemManager` |
+| +45–66 s | `[modem0] simple connect started` |
+
+So the **kernel-side** PLDR + port-reprobe burns ~25 s every wake even
+though the modem firmware was perfectly fine before suspend, and the
+**hook delay** adds another 10 s of slack on top.
+
+**Hergang.** Lid-close on this hardware is always
+suspend-then-hibernate (KDE + logind drop-in, `HibernateDelaySec=10min`).
+For the common case where the user reopens the lid within those 10 min
+the system never reaches hibernate — it only did s2idle. Yet the driver
+still ran a full firmware-suspend handshake on the way in
+(`H2D_CH_SUSPEND_REQ`), and on resume the firmware came back in L3/INIT
+and triggered the deferred-PLDR path — even though no real reset was
+needed, the firmware had simply been running normally the whole time.
+
+**Root cause.** Two compounding issues:
+
+1. The driver suspends the modem firmware on every s2idle entry even
+   though `t7xx_pci_pm_suspend_noirq` already keeps the PCIe device in
+   D0 (the firmware "cannot survive D3hot or D3cold" per the existing
+   comment). The full handshake is only required when the firmware is
+   actually about to lose power — i.e. hibernate.
+2. The sleep hook waits a worst-case 35 s before restarting MM, so even
+   if the kernel side got faster the user would still wait.
+
+**Fix.** New module parameter `keepalive_s2idle` (default off):
+
+- `t7xx_pci_pm_suspend()` early-returns 0 when both
+  `keepalive_s2idle=Y` *and* `pm_suspend_target_state == PM_SUSPEND_TO_IDLE`.
+  Hibernate (`.freeze`) sees `pm_suspend_target_state == PM_SUSPEND_ON`
+  and falls through to the full handshake — firmware loses power across
+  S4 regardless, so this is mandatory.
+- A `suspend_skipped` flag on `t7xx_pci_dev` lets `t7xx_pci_pm_resume`
+  and `t7xx_pci_pm_resume_noirq` short-circuit symmetrically (no MSI-X
+  toggling, no body work). Modem stayed online → nothing to recover.
+- `99-modem-fix.sh` greps the kernel log for the driver's
+  `keepalive_s2idle: skipping firmware suspend` banner in the last 30 s.
+  When seen, the post-resume MM-restart delay drops from 35 s to 3 s
+  (modem is registered, MBIM endpoint live; MM only needs to reopen
+  its session). Without the banner — i.e. real hibernate resume or
+  keepalive disabled — the original 35 s delay applies.
+
+The `pre/STH` MM-stop is unconditional even with keepalive: an STH
+cycle may still transition to actual hibernate, in which case the
+freeze callback runs the full handshake and we want MM out of the way
+to avoid the libmbim transaction-timeout SIGABRT (the 09:36 / 09:37
+incidents from 2026-04-17).
+
+**Reinstall opt-in.** `reinstall.sh` now prompts (or accepts
+`--keepalive` / `--no-keepalive`). The choice is persisted via
+`/etc/modprobe.d/mtk-t7xx-keepalive.conf`. Re-running the installer
+defaults to whatever was previously chosen, so the prompt is
+idempotent.
+
+**Trade-off.** Keepalive costs ~100 mW idle (≈0.03 % of the ~57 Wh
+battery per 10 min lid-closed) for a ~40 s reduction in resume
+latency. Hibernate behaviour is identical in both modes — firmware is
+power-cycled across S4 regardless.
+
+**Risks to watch in early use.**
+
+1. Modem firmware potentially wedging if it sits idle for the full
+   10 min s2idle window without IRQ servicing. Frozen userspace can't
+   poll, but the firmware itself keeps running — buffer pressure
+   should be near zero on an idle data session.
+2. PCIe ASPM stays in its normal-runtime state instead of being
+   toggled via `DISABLE_ASPM_LOWPWR` around the suspend handshake. The
+   skip path doesn't touch ASPM at all, which matches the
+   "running normally" baseline.
+3. MBIM session is held by the modem's own firmware across s2idle —
+   if it disagrees with MM's view after wake, MM will reopen on its
+   3 s scheduled restart anyway.
+
+**Verification plan.** Manual cycles before any further work:
+
+- `modprobe -r mtk_t7xx && modprobe mtk_t7xx keepalive_s2idle=1`
+- Lid close 30 s, lid open → confirm `mmcli -m 0` answers immediately
+  and `journalctl -k -b` shows `keepalive_s2idle: skipping firmware suspend`
+- Lid close 5 min, lid open → same
+- Lid close 9 min (just under STH transition), lid open → same
+- Lid close >10 min so STH actually hibernates → confirm full PLDR
+  path runs as before, MM restart at 35 s
+
+---
+
 ## 2026-04-21 — Deferred PLDR actually runs (v1.1.3)
 
 **Symptom.** User noticed "mobile data geht nicht mehr" during a work
