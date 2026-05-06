@@ -95,6 +95,13 @@ if [ -f /etc/modprobe.d/blacklist-mtk-t7xx.conf ]; then
     rm /etc/modprobe.d/blacklist-mtk-t7xx.conf
 fi
 
+# --- Remove keepalive_s2idle modprobe.d conf (only present if user opted in) ---
+KEEPALIVE_CONF="/etc/modprobe.d/mtk-t7xx-keepalive.conf"
+if [ -f "$KEEPALIVE_CONF" ]; then
+    echo "Removing keepalive_s2idle conf..."
+    rm "$KEEPALIVE_CONF"
+fi
+
 # --- Remove sleep hook ---
 SLEEP_HOOK="/usr/lib/systemd/system-sleep/99-modem-fix.sh"
 if [ -f "$SLEEP_HOOK" ]; then

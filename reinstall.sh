@@ -13,11 +13,15 @@ BLACKLIST_CONF="/etc/modprobe.d/blacklist-mtk-t7xx.conf"
 KVER="$(uname -r)"
 SKIP_BUILD=0
 ASSUME_YES=0
+KEEPALIVE_CONF="/etc/modprobe.d/mtk-t7xx-keepalive.conf"
+KEEPALIVE_S2IDLE=""   # "", "0", or "1" — set by flag or prompt
 
 for arg in "$@"; do
     case "$arg" in
         --skip-build) SKIP_BUILD=1 ;;
         -y|--yes) ASSUME_YES=1 ;;
+        --keepalive) KEEPALIVE_S2IDLE=1 ;;
+        --no-keepalive) KEEPALIVE_S2IDLE=0 ;;
     esac
 done
 
@@ -47,6 +51,58 @@ if ! grep -q 'iommu=pt' /proc/cmdline; then
     fi
 fi
 
+# Prompt for modem suspend strategy unless one was passed via flag.
+# Default reflects the existing config so re-running reinstall.sh is idempotent.
+if [ -z "$KEEPALIVE_S2IDLE" ]; then
+    if [ -f "$KEEPALIVE_CONF" ] && grep -q '^[[:space:]]*options.*keepalive_s2idle=1' "$KEEPALIVE_CONF"; then
+        DEFAULT_CHOICE=2
+        DEFAULT_LABEL="2 (keepalive)"
+    else
+        DEFAULT_CHOICE=1
+        DEFAULT_LABEL="1 (full suspend)"
+    fi
+    echo ""
+    echo "=== Modem suspend behavior ==="
+    echo "On suspend-to-idle (lid close, before any hibernate transition) the"
+    echo "modem firmware can either be told to suspend or be left running."
+    echo ""
+    echo "  1) Full suspend  — driver default. Firmware enters low-power."
+    echo "                     Resume needs PLDR + port reprobe (~30-45 s"
+    echo "                     before mobile data is back). Idle cost: ~0 mW."
+    echo "  2) Keepalive     — firmware stays online during s2idle, MBIM"
+    echo "                     session preserved. Resume < 5 s. Idle cost:"
+    echo "                     ~100 mW (≈0.03% battery per 10 min)."
+    echo ""
+    echo "  Hibernate is unaffected — firmware loses power across S4 either way."
+    echo ""
+    if [ "$ASSUME_YES" -eq 1 ]; then
+        case "$DEFAULT_CHOICE" in
+            2) KEEPALIVE_S2IDLE=1 ;;
+            *) KEEPALIVE_S2IDLE=0 ;;
+        esac
+        echo "[-y] using default: $DEFAULT_LABEL."
+    else
+        read -rp "Choose [1/2] (default $DEFAULT_LABEL): " choice
+        case "$choice" in
+            1) KEEPALIVE_S2IDLE=0 ;;
+            2) KEEPALIVE_S2IDLE=1 ;;
+            "")
+                case "$DEFAULT_CHOICE" in
+                    2) KEEPALIVE_S2IDLE=1 ;;
+                    *) KEEPALIVE_S2IDLE=0 ;;
+                esac
+                ;;
+            *) echo "Invalid choice; using default $DEFAULT_LABEL."
+                case "$DEFAULT_CHOICE" in
+                    2) KEEPALIVE_S2IDLE=1 ;;
+                    *) KEEPALIVE_S2IDLE=0 ;;
+                esac
+                ;;
+        esac
+    fi
+    echo ""
+fi
+
 # --- Build (no root needed) ---
 if [ "$SKIP_BUILD" -eq 0 ]; then
     echo "=== Building patched mtk_t7xx module ==="
@@ -63,6 +119,10 @@ if [ "$EUID" -ne 0 ]; then
     echo "Build succeeded. Elevating for install..."
     REEXEC_ARGS=(--skip-build)
     [ "$ASSUME_YES" -eq 1 ] && REEXEC_ARGS+=(-y)
+    case "$KEEPALIVE_S2IDLE" in
+        1) REEXEC_ARGS+=(--keepalive) ;;
+        0) REEXEC_ARGS+=(--no-keepalive) ;;
+    esac
     exec sudo bash "$SCRIPT_DIR/reinstall.sh" "${REEXEC_ARGS[@]}"
 fi
 
@@ -136,29 +196,39 @@ systemctl daemon-reload
 #       MM entirely on pre/hibernate|pre/STH and only start it back up after
 #       a reprobe-settle delay on post.
 #
-# Target handling:
+# Keepalive interaction: when the mtk_t7xx keepalive_s2idle module parameter
+# is set, the driver's .suspend callback is a no-op for s2idle and the modem
+# stays online. The hook detects this by grepping the kernel log for the
+# driver's "skipping firmware suspend" line in the last 30 s. When detected,
+# the post-resume MM restart uses a 3 s delay instead of 35 s — there is no
+# PLDR or port reprobe to wait out.
+#
+# Target handling (default; "fast" path applies when keepalive_s2idle skipped):
 #   pre/suspend                    → cancel pending restart (MM keeps running)
 #   pre/hibernate, pre/STH         → stop MM + cancel pending
 #   post/suspend                   → schedule restart in 3 s
-#   post/hibernate, post/STH       → schedule restart in 10 s
+#   post/hibernate, post/STH       → schedule restart in 35 s (3 s if fast)
 #
 # STH cancellation math: during a full STH cycle systemd fires the hook four
 # times: pre(entry), post(s2idle-wake for transition), pre(hibernate leg),
 # post(after resume). The intermediate post→pre gap is ~140 ms, far shorter
-# than the 10 s delay, so the scheduled restart is cancelled before its sleep
-# elapses and the driver is not disturbed mid-reprobe.
+# than even the 3 s fast delay, so the scheduled restart is cancelled before
+# its sleep elapses and the driver is not disturbed mid-reprobe.
 SLEEP_HOOK="/usr/lib/systemd/system-sleep/99-modem-fix.sh"
 cat > "$SLEEP_HOOK" <<'HOOKEOF'
 #!/bin/bash
 # Restart ModemManager around suspend/hibernate.
 #
-#   - s2idle resume: stale MBIM session → restart MM for fresh MBIM_OPEN
+#   - s2idle resume (default): stale MBIM session → restart MM for fresh
+#     MBIM_OPEN.
 #   - hibernate/STH resume: modem is in mtk_t7xx L3/INIT reprobe (up to
 #     3 attempts; per driver source each attempt can span the 30 s port
 #     enumeration + 60 s handshake window). If MM is polling MBIM during
 #     that window libmbim abort()s on transaction timeout (signal 6) and
 #     MM exits mid-init. Fix: stop MM on pre, start it after a 35 s delay
 #     on post — covers the common PLDR reinit case.
+#   - keepalive_s2idle skipped path: driver did not touch firmware, modem
+#     is still online → 3 s delay is enough for MM to reopen MBIM cleanly.
 #
 # The schedule uses a systemd timer (--on-active), not an inner sleep, so
 # cancellation on the intermediate pre of an STH cycle is race-free: we
@@ -168,11 +238,21 @@ cat > "$SLEEP_HOOK" <<'HOOKEOF'
 # that can otherwise make `systemd-run --unit=NAME` fail with EEXIST if
 # the same name is still Inactive/dead but not yet collected.
 #
-# Debug with:  journalctl -b | grep modem-fix
+# Debug with:  journalctl -b | grep -E 'modem-fix|keepalive_s2idle'
 LOG_TAG="modem-fix"
 UNIT_FILE=/run/modem-fix-resume.unit
+KEEPALIVE_PARAM="/sys/module/mtk_t7xx/parameters/keepalive_s2idle"
 
 logger -t "$LOG_TAG" "hook called: action=$1 target=${2:-unknown}"
+
+# Did the driver just skip the firmware suspend handshake (keepalive path)?
+# Look for the dev_info banner in the kernel log within the last 30 s.
+recent_keepalive_skip() {
+    [ -r "$KEEPALIVE_PARAM" ] || return 1
+    [ "$(cat "$KEEPALIVE_PARAM" 2>/dev/null)" = "Y" ] || return 1
+    journalctl -k -b --since "30s ago" 2>/dev/null \
+        | grep -q "keepalive_s2idle: skipping firmware suspend"
+}
 
 cancel_pending() {
     [ -f "$UNIT_FILE" ] || return 0
@@ -203,6 +283,9 @@ case "$1/$2" in
     pre/hibernate|pre/suspend-then-hibernate)
         # Stop MM so it is not polling MBIM during the post-S4 L3/INIT
         # reprobe window (prevents libmbim transaction_timed_out SIGABRT).
+        # Done unconditionally even with keepalive: STH may still transition
+        # to actual hibernate, in which case the freeze callback runs the
+        # full handshake and we need MM out of the way.
         cancel_pending
         if systemctl is-active ModemManager >/dev/null 2>&1; then
             logger -t "$LOG_TAG" "stopping ModemManager before ${2}"
@@ -214,11 +297,19 @@ case "$1/$2" in
         schedule_mm 3
         ;;
     post/hibernate|post/suspend-then-hibernate)
-        # Hibernate/STH resume: longer delay so kernel-side mtk_t7xx reprobe
-        # can complete before MM opens MBIM. During an STH cycle this
-        # schedule is cancelled by the immediately-following pre on its way
-        # into the actual hibernate phase (~140 ms gap), far before 35 s.
-        schedule_mm 35
+        if recent_keepalive_skip; then
+            # Driver skipped firmware suspend → modem still registered,
+            # MBIM endpoint live. MM only needs to reopen its session.
+            logger -t "$LOG_TAG" "keepalive_s2idle skip detected — using fast restart"
+            schedule_mm 3
+        else
+            # Hibernate/STH resume: longer delay so kernel-side mtk_t7xx
+            # reprobe can complete before MM opens MBIM. During an STH cycle
+            # this schedule is cancelled by the immediately-following pre on
+            # its way into the actual hibernate phase (~140 ms gap), far
+            # before 35 s.
+            schedule_mm 35
+        fi
         ;;
 esac
 HOOKEOF
@@ -318,6 +409,24 @@ restorecon "$SDDM_HOOK" 2>/dev/null || true
 else
     echo "NOTE: /usr/local/bin/generate-sddm-display-config not found; skipping SDDM hook install."
     echo "      (This hook is for multi-monitor KDE/SDDM setups and needs that helper script.)"
+fi
+
+# Apply modem suspend strategy. The driver param defaults to off — the conf
+# file is only present when the user explicitly opted into keepalive_s2idle.
+if [ "${KEEPALIVE_S2IDLE:-0}" = "1" ]; then
+    cat > "$KEEPALIVE_CONF" <<'EOF'
+# Keep FM350-GL firmware running during suspend-to-idle.
+# Cost: ~100 mW idle (≈0.03% battery per 10 min lid-closed).
+# Win:  resume < 5 s instead of ~30-45 s (no PLDR + port reprobe).
+# Hibernate (S4) is unaffected — firmware always loses power across S4.
+options mtk_t7xx keepalive_s2idle=1
+EOF
+    echo "Wrote $KEEPALIVE_CONF — firmware will stay online during s2idle."
+else
+    if [ -f "$KEEPALIVE_CONF" ]; then
+        rm -f "$KEEPALIVE_CONF"
+        echo "Removed $KEEPALIVE_CONF — using default full-suspend behavior."
+    fi
 fi
 
 # Rebuild initramfs

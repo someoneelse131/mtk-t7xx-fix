@@ -73,6 +73,9 @@ enum t7xx_mode {
  * @deferred_pldr_work: worker that runs a deferred PLDR reset after resume
  *                     completes (covers the s2idle-wake path where no further
  *                     resume callback would otherwise occur)
+ * @suspend_skipped: set in .suspend when keepalive_s2idle made the callback a
+ *                   no-op; consumed in .resume / .resume_noirq to skip their
+ *                   bodies symmetrically (modem stayed online throughout)
  * @mode: indicates the device mode
  */
 struct t7xx_pci_dev {
@@ -96,6 +99,7 @@ struct t7xx_pci_dev {
 	unsigned int		resume_reprobe_count;
 	struct completion	sleep_lock_acquire;
 	struct delayed_work	deferred_pldr_work;
+	bool			suspend_skipped;
 #ifdef CONFIG_WWAN_DEBUGFS
 	struct dentry		*debugfs_dir;
 #endif

@@ -63,13 +63,44 @@ bash reinstall.sh
 
 The script will build the module as your user, then `sudo` for the install step. After install it prompts for confirmation before rebooting.
 
-**Non-interactive mode.** Pass `-y` / `--yes` to skip both prompts
-(the `iommu=pt` warning and the reboot confirmation). Useful for
-scripting:
+**Non-interactive mode.** Pass `-y` / `--yes` to skip prompts
+(the `iommu=pt` warning, the suspend-strategy choice, and the reboot
+confirmation). Useful for scripting:
 
 ```bash
-bash reinstall.sh -y
+bash reinstall.sh -y                     # default = full suspend
+bash reinstall.sh -y --keepalive         # opt into keepalive_s2idle
+bash reinstall.sh -y --no-keepalive      # explicit full suspend
 ```
+
+## Suspend strategy: full suspend vs `keepalive_s2idle`
+
+On suspend-to-idle (lid close, before any hibernate transition) the
+driver can either tell the modem firmware to suspend or leave it
+running. The installer prompts for this; you can re-run `reinstall.sh`
+any time to change.
+
+| | Full suspend (default) | `keepalive_s2idle` |
+|---|---|---|
+| **Resume latency** | 30–45 s before mobile data is back (PLDR + port reprobe) | < 5 s (modem was never offline) |
+| **s2idle idle cost** | ~0 mW from the modem | ~100 mW (≈0.03 % battery per 10 min) |
+| **Hibernate (S4)** | full firmware power-down (always) | full firmware power-down (always) |
+| **Risk** | tested, stable | newer; modem firmware idles unattended for up to 10 min |
+
+The keepalive path skips the `H2D_CH_SUSPEND_REQ` handshake during
+s2idle and lets the modem keep its MBIM session, network registration,
+and PDP context. Hibernate behaviour is identical either way — the
+firmware loses power across S4 regardless of this setting.
+
+Toggle at runtime (until next reboot):
+
+```bash
+echo Y | sudo tee /sys/module/mtk_t7xx/parameters/keepalive_s2idle
+echo N | sudo tee /sys/module/mtk_t7xx/parameters/keepalive_s2idle
+```
+
+Persistent setting lives at `/etc/modprobe.d/mtk-t7xx-keepalive.conf`
+(only present when keepalive is enabled).
 
 ## After reboot
 
@@ -117,7 +148,8 @@ All of this is idempotent -- safe to run repeatedly.
 6. Disables Lenovo Fibocom services that force the modem into fastboot
 7. Adds a systemd drop-in to cap ModemManager's stop timeout at 10 s (it hangs for 45 s otherwise)
 8. Installs a systemd sleep hook to restart ModemManager after resume (fixes stale MBIM session)
-9. Rebuilds initramfs and reboots
+9. Prompts whether to enable `keepalive_s2idle` (modem stays online during s2idle for fast resume; see below)
+10. Rebuilds initramfs and reboots
 
 ## Other scripts
 
@@ -215,6 +247,7 @@ The patched driver source lives in `src/`. Key changes:
 | `t7xx_pci.c` | Shutdown calls `t7xx_md_exit()` after suspend to stop the TX thread and prevent the poweroff hang |
 | `t7xx_pci.c` | Shutdown forces `mode=UNKNOWN` on poweroff/reboot so the PM handshake is skipped against a desynchronised SAP |
 | `t7xx_pci.c` | Hibernate entry defers PLDR when PCIe link is still up (avoids NVMe wedge), with a `delayed_work` follow-up that actually runs the deferred reset after resume completes (covers the s2idle-wake-only path) |
+| `t7xx_pci.c` | Optional `keepalive_s2idle` module param: when set, `.suspend` is a no-op for `PM_SUSPEND_TO_IDLE` and `.resume` / `.resume_noirq` mirror the skip via a `suspend_skipped` flag — modem firmware stays online across s2idle, ~40 s faster wake; hibernate paths are unaffected |
 | `t7xx_port_ctrl_msg.c` | NULL `port->thread` after `kthread_stop()` (prevents double-uninit crash) |
 | `t7xx_port_ctrl_msg.c` | NULL `port->thread` on `kthread_run()` failure (prevents ERR_PTR dereference) |
 | `t7xx_state_monitor.c` | Device-stage timeout increased to 60 s |

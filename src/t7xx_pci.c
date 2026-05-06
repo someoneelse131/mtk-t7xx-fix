@@ -60,6 +60,18 @@
 #define DEFERRED_PLDR_DELAY_MS		3000
 #define DEFERRED_PLDR_RETRY_MS		2000
 
+/* When set, the .suspend callback is a no-op for suspend-to-idle: the modem
+ * firmware keeps running, the MBIM session stays open, and resume returns
+ * immediately. Idle cost is the modem's normal registered-no-traffic draw
+ * (~100 mW for FM350-GL); the win is skipping the ~25 s PLDR + port-reprobe
+ * dance that follows a normal resume. Hibernate paths (.freeze / .restore)
+ * are unaffected — the firmware loses power across S4 regardless.
+ */
+static bool keepalive_s2idle;
+module_param(keepalive_s2idle, bool, 0644);
+MODULE_PARM_DESC(keepalive_s2idle,
+		 "Skip firmware suspend handshake during suspend-to-idle (faster resume; modem stays online; ignored for hibernate)");
+
 static const char * const t7xx_mode_names[] = {
 	[T7XX_UNKNOWN] = "unknown",
 	[T7XX_READY] = "ready",
@@ -952,6 +964,16 @@ static int t7xx_pci_pm_resume_noirq(struct device *dev)
 	struct t7xx_pci_dev *t7xx_dev;
 
 	t7xx_dev = pci_get_drvdata(pdev);
+
+	/* Symmetric with the keepalive .suspend skip: if we never tore down
+	 * the firmware-side PM state, do not touch MSI-X here either. The
+	 * matching unmask lives in __t7xx_pci_pm_resume which we will also
+	 * skip — leaving interrupts in their pre-suspend state preserves the
+	 * "modem was running the entire time" invariant.
+	 */
+	if (t7xx_dev->suspend_skipped)
+		return 0;
+
 	t7xx_pcie_mac_interrupts_dis(t7xx_dev);
 
 	return 0;
@@ -1018,12 +1040,35 @@ static int t7xx_pci_pm_prepare(struct device *dev)
 
 static int t7xx_pci_pm_suspend(struct device *dev)
 {
-	return __t7xx_pci_pm_suspend(to_pci_dev(dev));
+	struct pci_dev *pdev = to_pci_dev(dev);
+	struct t7xx_pci_dev *t7xx_dev = pci_get_drvdata(pdev);
+
+	/* Keepalive: only meaningful for suspend-to-idle. Hibernate (.freeze)
+	 * uses the same wrapper but pm_suspend_target_state is PM_SUSPEND_ON
+	 * during the hibernate freeze callback path, so the check naturally
+	 * gates this to s2idle (and S3, which behaves the same way wrt the
+	 * modem firmware — but Lenovo platforms ship s2idle only).
+	 */
+	if (keepalive_s2idle && pm_suspend_target_state == PM_SUSPEND_TO_IDLE) {
+		dev_info(dev, "[PM] keepalive_s2idle: skipping firmware suspend handshake\n");
+		t7xx_dev->suspend_skipped = true;
+		return 0;
+	}
+	t7xx_dev->suspend_skipped = false;
+	return __t7xx_pci_pm_suspend(pdev);
 }
 
 static int t7xx_pci_pm_resume(struct device *dev)
 {
-	return __t7xx_pci_pm_resume(to_pci_dev(dev), true);
+	struct pci_dev *pdev = to_pci_dev(dev);
+	struct t7xx_pci_dev *t7xx_dev = pci_get_drvdata(pdev);
+
+	if (t7xx_dev->suspend_skipped) {
+		t7xx_dev->suspend_skipped = false;
+		dev_info(dev, "[PM] keepalive_s2idle: skipping resume (modem stayed online)\n");
+		return 0;
+	}
+	return __t7xx_pci_pm_resume(pdev, true);
 }
 
 static int t7xx_pci_pm_thaw(struct device *dev)
