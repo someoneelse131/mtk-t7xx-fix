@@ -315,8 +315,8 @@ static void t7xx_deferred_pldr_worker(struct work_struct *work)
 			ret);
 		complete_all(&t7xx_dev->init_done);
 	} else {
-		/* Mirror the zero-on-success convention of the main
-		 * resume path at __t7xx_pci_pm_resume (line ~775).
+		/* Mirror the zero-on-success convention used by the main
+		 * resume path's L3/INIT and handshake-success branches.
 		 * Without this, a subsequent L3/INIT resume would see a
 		 * stale non-zero count and prematurely hit the MAX cap.
 		 */
@@ -795,6 +795,19 @@ static int __t7xx_pci_pm_resume(struct pci_dev *pdev, bool state_check)
 				ret = t7xx_reset_device(t7xx_dev, PLDR);
 				if (ret)
 					goto out_reprobe_failed;
+				/* Reset the cap on success: the only failure mode
+				 * we can detect synchronously is the reprobe call
+				 * itself returning non-zero.  A successful submit
+				 * means the FSM is bringing the modem back up
+				 * (async), and the next L3/INIT resume — e.g. the
+				 * very next hibernate restore — must start with a
+				 * fresh budget, otherwise three healthy hibernate
+				 * cycles in a row exhaust the cap and the fourth
+				 * gives up before even trying.  Mirrors the
+				 * zero-on-success convention in the deferred PLDR
+				 * worker (t7xx_deferred_pldr_worker).
+				 */
+				t7xx_dev->resume_reprobe_count = 0;
 				return 0;
 			}
 
@@ -805,6 +818,7 @@ static int __t7xx_pci_pm_resume(struct pci_dev *pdev, bool state_check)
 			ret = t7xx_pci_reprobe(t7xx_dev, true);
 			if (ret)
 				goto out_reprobe_failed;
+			t7xx_dev->resume_reprobe_count = 0;
 			return 0;
 		}
 
@@ -879,6 +893,7 @@ static int __t7xx_pci_pm_resume(struct pci_dev *pdev, bool state_check)
 		ret = t7xx_pci_reprobe(t7xx_dev, true);
 		if (ret)
 			goto out_reprobe_failed;
+		t7xx_dev->resume_reprobe_count = 0;
 		return 0;
 	}
 
