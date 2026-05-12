@@ -2,7 +2,7 @@
 
 Patches the `mtk_t7xx` kernel driver so the Fibocom FM350-GL (MediaTek T700, PCI ID `14c3:4d75`) WWAN modem actually works on Fedora (kernels 6.17+).
 
-Tested on Lenovo ThinkPad X1 Carbon Gen 11, Fedora 43, kernel 6.18.10.
+Tested on Lenovo ThinkPad X1 Carbon Gen 11, Fedora 43, kernel 6.18.x – 6.19.x. Current stable release: **v1.2.0** (extensive S4 / suspend-then-hibernate testing).
 
 Related Fedora discussion: [Issue activating mobile internet modem on a Lenovo ThinkPad X1 Yoga Gen 8](https://discussion.fedoraproject.org/t/issue-activating-mobile-internet-modem-on-a-lenovo-thinkpad-x1-yoga-gen-8/170623)
 
@@ -20,6 +20,7 @@ On Fedora 43 the in-tree `mtk_t7xx` driver fails to initialize the modem. Multip
 8. **Dead modem after sleep** -- the modem firmware sometimes reboots during s2idle. The ATR register retains a stale valid value, so the driver skips reprobing and attempts a normal handshake resume. The SAP channel times out but the driver continues anyway, leaving the modem in a zombie state where all communication fails.
 9. **Infinite reprobe loop freezes system** -- the fix for issue 8 unconditionally reprobed on SAP resume timeout, but this also triggers during normal L1 runtime PM resumes (e.g. when the modem is rfkill-blocked). The reprobe restarts the modem, runtime PM re-enables, the same timeout recurs, creating an infinite loop. After ~10 minutes of repeated reprobes, kernel memory is corrupted, causing a General Protection Fault, RCU stall, and total system freeze requiring a hard reboot.
 10. **Dead modem after s2idle wake (v1.1.3)** -- the hibernate-hang fix introduced in v1.1.2 deferred a PLDR reset to avoid wedging NVMe during hibernate entry, assuming a later resume callback would run it. That assumption only held when STH continued into hibernate. If the user woke from s2idle before the hibernate delay, no later callback ran and the modem stayed in L3/INIT with every port write returning EIO — only a cold reboot recovered.
+11. **CLDMA ring desync after S4 resume (v1.2.0)** -- after suspend-then-hibernate cycles that actually reached S4, the post-resume plain reprobe path sometimes left the driver's in-memory CLDMA ring SW state stale relative to the firmware's fresh hardware queue pointers. The MD handshake (via MHCCIF, not CLDMA) reported success, but every MBIM transaction timed out. Smoking gun: `CLDMA1 queue 0 is not empty` in dmesg, followed by ModemManager SIGABRTing every ~36 s. Required reboot to recover.
 
 The same hardware works fine on Ubuntu (kernel 6.14) because it uses IOMMU passthrough and doesn't ship the Lenovo services.
 
@@ -247,6 +248,7 @@ The patched driver source lives in `src/`. Key changes:
 | `t7xx_pci.c` | Shutdown calls `t7xx_md_exit()` after suspend to stop the TX thread and prevent the poweroff hang |
 | `t7xx_pci.c` | Shutdown forces `mode=UNKNOWN` on poweroff/reboot so the PM handshake is skipped against a desynchronised SAP |
 | `t7xx_pci.c` | Hibernate entry defers PLDR when PCIe link is still up (avoids NVMe wedge), with a `delayed_work` follow-up that actually runs the deferred reset after resume completes (covers the s2idle-wake-only path) |
+| `t7xx_pci.c` | `.restore` (post-S4 resume) always forces a chip-level PLDR + full reprobe instead of the plain handshake-only path. Catches CLDMA ring desync after firmware power-cycle. Scoped to `.restore` only — `.resume` / `.thaw` / `.runtime_resume` keep their fast plain-reprobe behaviour |
 | `t7xx_pci.c` | Optional `keepalive_s2idle` module param: when set, `.suspend` is a no-op for `PM_SUSPEND_TO_IDLE` and `.resume` / `.resume_noirq` mirror the skip via a `suspend_skipped` flag — modem firmware stays online across s2idle, ~40 s faster wake; hibernate paths are unaffected |
 | `t7xx_port_ctrl_msg.c` | NULL `port->thread` after `kthread_stop()` (prevents double-uninit crash) |
 | `t7xx_port_ctrl_msg.c` | NULL `port->thread` on `kthread_run()` failure (prevents ERR_PTR dereference) |

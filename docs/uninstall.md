@@ -16,12 +16,12 @@ Before uninstalling, know what's on the system. The install
 
 | Item | Path | Purpose |
 |---|---|---|
-| Patched `mtk_t7xx` kernel module | `/var/lib/dkms/mtk_t7xx/<ver>/` + `/usr/src/mtk_t7xx-<ver>/` | DKMS-built patched driver; loaded automatically by kernel via depmod priority (extra/ > kernel/). Current versions: 1.1.2 or 1.1.3. |
+| Patched `mtk_t7xx` kernel module | `/var/lib/dkms/mtk_t7xx/<ver>/` + `/usr/src/mtk_t7xx-<ver>/` | DKMS-built patched driver; loaded automatically by kernel via depmod priority (extra/ > kernel/). Current version: 1.2.0 (earlier installs may have 1.1.2 or 1.1.3 trees still on disk). |
 | FCC unlock script | `/usr/lib64/ModemManager/fcc-unlock.d/14c3:4d75` | Replacement for Lenovo's segfaulting binary — AT-based, from ModemManager's own share dir. |
 | `xxd` binary | `/usr/bin/xxd` (via `vim-common` package) | Required by the FCC unlock script. May be shared with other tools — we do NOT remove the package. |
 | Modem sleep hook | `/usr/lib/systemd/system-sleep/99-modem-fix.sh` | Stops MM before hibernate/STH, restarts on resume. |
 | SDDM sleep hook (optional) | `/usr/lib/systemd/system-sleep/50-sddm-displays.sh` | Only created if `/usr/local/bin/generate-sddm-display-config` exists on the host. Regenerates SDDM display config on wake. Contains marker `"Prevent SDDM's KWin from crashing on hibernate resume"` — `uninstall.sh` only removes if the marker is present (protects any pre-existing file with the same name). |
-| ModemManager drop-in | `/etc/systemd/system/ModemManager.service.d/quick-stop.conf` | Caps MM's `TimeoutStopSec` at 10 s (was 5 s in 1.1.2, 10 s in 1.1.3). |
+| ModemManager drop-in | `/etc/systemd/system/ModemManager.service.d/quick-stop.conf` | Caps MM's `TimeoutStopSec` at 10 s (was 5 s in 1.1.2, 10 s since 1.1.3). |
 | Fibocom services disabled | `fibo_helper.service`, `fibo_flash.service`, `fwswitch.service`, `lenovo-cfgservice.service` | Lenovo services that hijack the modem into fastboot ~15 s after connect. Disabled but not uninstalled. |
 | `iommu=pt` kernel cmdline arg | `grubby` / `/proc/cmdline` | Required for the modem's DMA pattern on Fedora. Optional to remove. |
 | Module blacklist (legacy) | `/etc/modprobe.d/blacklist-mtk-t7xx.conf` | Historical artifact; should not exist on fresh installs but cleaned up if present. |
@@ -43,9 +43,10 @@ that this project fixed. After uninstall:
   NOT re-enable them. If you re-enable manually (see below), expect
   bootloops.
 - **Mobile data after resume will degrade**: the in-tree driver does
-  not have the L3/INIT reprobe, the PLDR deferral, or the deferred-PLDR
-  follow-up — so the scenarios fixed in v1.0.x through v1.1.3 can
-  recur. Cold reboot becomes a normal recovery tool again.
+  not have the L3/INIT reprobe, the PLDR deferral, the deferred-PLDR
+  follow-up, or the always-PLDR-on-.restore fix — so the scenarios
+  fixed in v1.0.x through v1.2.0 can recur. Cold reboot becomes a
+  normal recovery tool again.
 - **Shutdown may hang**: the TX-thread-stop fix (`c52a9aa`) and the
   skip-handshake-on-poweroff fix (`22bf201`) go away. Silent
   multi-minute poweroff stalls can recur.
@@ -77,7 +78,7 @@ What the script does, in order:
 1. **Confirm** (unless `-y`).
 2. **Remove every installed DKMS version** of `mtk_t7xx` — enumerates
    `dkms status` and `/usr/src/mtk_t7xx-*` so an upgrade history of
-   multiple versions (e.g. 1.1.2 plus 1.1.3) all get torn down.
+   multiple versions (e.g. 1.1.2, 1.1.3, and 1.2.0) all get torn down.
 3. **Clean root-owned build artifacts** from the project's `src/` dir
    (`.cmd`, `.o`, `.ko`, `Module.symvers`, etc.).
 4. **Remove the module blacklist** if present (legacy path).

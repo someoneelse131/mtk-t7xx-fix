@@ -21,7 +21,7 @@ suspend-then-hibernate on lid-close (KDE + logind drop-in).
 
 ---
 
-## 2026-05-05 — Always-PLDR on `.restore` (Option B)
+## 2026-05-05 — Always-PLDR on `.restore` (Option B, v1.2.0)
 
 **Symptom.** After STH cycles that fully transition to S4, the
 post-resume `mtk_t7xx` plain-reprobe path sometimes leaves the modem
@@ -94,20 +94,20 @@ apply.
 in exchange for catching every CLDMA-ring-desync incident.
 
 **Verification.** Build clean against kernel 6.19.14 out-of-tree.
-Runtime verification deferred to user — plan:
+Runtime verification by user across multiple S4 cycles (2026-05-05
+through 2026-05-12): every post-S4 resume now recovers mobile data
+without modem death. Notable observations:
 
-```bash
-sudo systemctl suspend-then-hibernate
-# wait 10+ min for HibernateDelaySec, then power button or lid
-journalctl -k -b | grep -E '\[PM\] Restore|forcing PLDR|MRST'
-# Expected: "[PM] Restore: forcing PLDR (attempt 1/3)" once per S4 wake
-# Expected: NO "CLDMA1 queue 0 is not empty"
-mmcli -m 0 | grep state
-# Expected: connected within ~40 s of wake
-```
+- `[PM] Restore: forcing PLDR (attempt 1/3)` appears once per S4 wake
+- No `CLDMA1 queue 0 is not empty` warnings anymore
+- No ModemManager SIGABRT loops after S4 resume
+- Time-to-mobile-data after S4 is noticeably longer than after plain
+  s2idle wake (PLDR + full reprobe + post-resume MM-restart timer
+  stack up) — known cost of the always-PLDR policy; future work to
+  consider tightening the post-resume MM-restart delay on the
+  `.restore` path specifically.
 
-Repeat for 2 min, 10 min, 1 h, 8 h S4. Each should succeed without
-modem death.
+Declared stable as **v1.2.0** on 2026-05-12.
 
 Full root-cause investigation in
 `docs/superpowers/2026-05-05-investigation.md` (parallel agent
@@ -115,7 +115,7 @@ review producing the reviewed code sketch this commit applied).
 
 ---
 
-## 2026-04-28 — `keepalive_s2idle` option for fast s2idle wake
+## 2026-04-28 — `keepalive_s2idle` option for fast s2idle wake (lands in v1.2.0)
 
 **Symptom (none — feature, not bug).** After every lid-open the user
 waits 45–66 s before mobile data is back. Profile of three consecutive
